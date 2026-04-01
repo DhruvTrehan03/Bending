@@ -71,134 +71,83 @@ def make_permittivity(state_high, variable_mask, low_cond, high_cond):
     return perm
 
 
+def voltage_range(v):
+    vals = np.asarray(v).ravel()
+    return float(np.max(vals) - np.min(vals))
+
+
 def element_sensitivity_from_jacobian(jacobian):
-    """Calculate element sensitivity as the L1 norm of jacobian columns."""
-    return np.log10(np.sum(np.abs(jacobian), axis=0) + np.finfo(float).tiny)
+    return np.linalg.norm(np.asarray(jacobian), axis=0)
 
 
-def entropy_score(sensitivity):
-    """Compute Shannon entropy of element sensitivity distribution.
+def sensitivity_uniformity_score(sensitivity, norm_scale=1.0):
+    """Sensitivity uniformity objective (minimized by optimizer).
+
+    Lower score means a more spatially uniform element sensitivity pattern.
+    """
+    vals = np.abs(np.asarray(sensitivity).ravel())
+    eps = np.finfo(float).eps
+
+    # Keep optional scaling for compatibility with CLI and previous runs.
+    scale = max(float(norm_scale), eps)
+    normalized = vals / scale
+
+    mean_sens = float(np.mean(normalized))
+    std_sens = float(np.std(normalized))
+
+    # Coefficient of variation: dimensionless uniformity score.
+    score = std_sens / max(mean_sens, eps)
+    return float(score)
+
+
+def entropy_score(sensitivity, norm_scale=1.0):
+    """Shannon entropy of sensitivity distribution (minimized by optimizer).
     
-    Lower entropy indicates more uniform/concentrated sensitivity across elements.
-    Returns the Shannon entropy: -sum(p * log(p)) where p is a normalized
-    probability distribution of sensitivity values.
+    Lower entropy means a more uniform/concentrated sensitivity pattern.
+    Entropy is calculated from a normalized probability distribution of sensitivity values.
     """
     vals = np.abs(np.asarray(sensitivity).ravel())
     eps = np.finfo(float).eps
     
+    # Normalize sensitivity values to sum to 1 (probability distribution)
     total = np.sum(vals)
     if total < eps:
         return 0.0
     
     probabilities = vals / total
+    
+    # Calculate Shannon entropy: -sum(p * log(p))
     # Only include non-zero probabilities to avoid log(0)
     entropy = -np.sum(probabilities[probabilities > eps] * np.log(probabilities[probabilities > eps]))
-    mean_sensitivity = np.mean(vals)
-    return float(entropy+mean_sensitivity)
+    
+    return float(entropy)
 
 
-def build_element_adjacency(mesh_obj):
-    """Build adjacency matrix for elements based on shared vertices.
-    
-    Two elements are considered adjacent if they share at least 2 vertices (an edge).
-    Returns adjacency as a list of lists where adjacency[i] contains indices of
-    elements adjacent to element i.
-    """
-    tri = mesh_obj.element
-    n_elem = tri.shape[0]
-    adjacency = [[] for _ in range(n_elem)]
-    
-    for i in range(n_elem):
-        vertices_i = set(tri[i])
-        for j in range(i + 1, n_elem):
-            vertices_j = set(tri[j])
-            # Elements are adjacent if they share at least 2 vertices (an edge)
-            if len(vertices_i & vertices_j) >= 2:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    
-    return adjacency
+def sensitivity_objective_components(sensitivity, norm_scale=1.0):
+    vals = np.abs(np.asarray(sensitivity).ravel())
+    eps = np.finfo(float).eps
+
+    scale = max(float(norm_scale), eps)
+    normalized = vals / scale
+    mean_sens = float(np.mean(normalized))
+    std_sens = float(np.std(normalized))
+    score = float(std_sens / max(mean_sens, eps))
+    return mean_sens, std_sens, score
 
 
-def get_connected_components(state_high, adjacency):
-    """Identify connected components of high-conductivity elements.
-    
-    Args:
-        state_high: Boolean array where True indicates high-conductivity element
-        adjacency: Adjacency list where adjacency[i] is list of adjacent elements
-    
-    Returns:
-        List of lists, where each sublist contains indices of elements in a
-        connected component of high-conductivity elements.
-    """
-    n_elem = len(state_high)
-    visited = np.zeros(n_elem, dtype=bool)
-    components = []
-    
-    for start_elem in range(n_elem):
-        if not state_high[start_elem] or visited[start_elem]:
-            continue
-        
-        # BFS to find all connected high-conductivity elements
-        component = []
-        queue = [start_elem]
-        visited[start_elem] = True
-        
-        while queue:
-            elem_idx = queue.pop(0)
-            component.append(elem_idx)
-            
-            for adjacent_elem in adjacency[elem_idx]:
-                if not visited[adjacent_elem] and state_high[adjacent_elem]:
-                    visited[adjacent_elem] = True
-                    queue.append(adjacent_elem)
-        
-        components.append(component)
-    
-    return components
+def is_sensitivity_uniformity_target(target):
+    return target in {"sensitivity-uniformity", "sensitivity-matrix-uniformity"}
 
 
-def count_isolated_high_elements(state_high, adjacency):
-    """Count number of isolated high-conductivity elements.
-    
-    An element is isolated if it has no high-conductivity neighbors.
-    """
-    isolated_count = 0
-    for i in range(len(state_high)):
-        if state_high[i]:
-            has_high_neighbor = any(state_high[j] for j in adjacency[i])
-            if not has_high_neighbor:
-                isolated_count += 1
-    
-    return isolated_count
-
-
-def has_connected_high_elements(state_high, adjacency):
-    """Check if all high-conductivity elements form a single connected component.
-    
-    Returns True if all high-conductivity elements are connected, False otherwise.
-    If there are no high-conductivity elements or only one, returns True.
-    """
-    n_high = np.sum(state_high)
-    if n_high <= 1:
-        return True
-    
-    components = get_connected_components(state_high, adjacency)
-    return len(components) == 1
-
-
-def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=None, connectivity_penalty=1e6):
-    """Evaluate element state by computing sensitivity entropy with connectivity constraint.
-    
-    Args:
-        fwd: Forward EIT solver
-        state: Boolean array of high/low conductivity state
-        variable_mask: Mask of variable elements
-        low_cond: Low conductivity value
-        high_cond: High conductivity value
-        adjacency: Element adjacency list (optional). If provided, penalty applied for disconnected high elements.
-        connectivity_penalty: Penalty value for each isolated high-conductivity element
-    """
+def evaluate_state(
+    fwd,
+    state,
+    variable_mask,
+    low_cond,
+    high_cond,
+    target,
+    sens_norm_scale=1.0,
+):
     perm = make_permittivity(
         state_high=state,
         variable_mask=variable_mask,
@@ -206,16 +155,22 @@ def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=Non
         high_cond=high_cond,
     )
 
-    jacobian, _ = fwd.compute_jac(perm=perm)
-    sensitivity = element_sensitivity_from_jacobian(jacobian)
-    score = entropy_score(sensitivity)
-    
-    # Apply connectivity constraint penalty
-    if adjacency is not None:
-        isolated_count = count_isolated_high_elements(state, adjacency)
-        score += isolated_count * connectivity_penalty
+    if target == "voltage-range":
+        v = np.asarray(fwd.solve_eit(perm=perm)).ravel()
+        sensitivity = None
+        score = voltage_range(v)
+    elif is_sensitivity_uniformity_target(target):
+        jacobian, v0 = fwd.compute_jac(perm=perm)
+        v = np.asarray(v0).ravel()
+        sensitivity = element_sensitivity_from_jacobian(jacobian)
+        score = sensitivity_uniformity_score(
+            sensitivity,
+            norm_scale=sens_norm_scale,
+        )
+    else:
+        raise ValueError(f"Unknown target: {target}")
 
-    return perm, sensitivity, score
+    return perm, v, sensitivity, score
 
 
 def optimize_global_all_elements_ga(
@@ -223,6 +178,7 @@ def optimize_global_all_elements_ga(
     variable_mask,
     low_cond,
     high_cond,
+    target,
     generations,
     pop_size,
     elite_count,
@@ -231,15 +187,9 @@ def optimize_global_all_elements_ga(
     init_high_fraction,
     tournament_size,
     seed,
-    adjacency=None,
-    connectivity_penalty=1e6,
+    sens_norm_scale,
 ):
-    """Global optimization of element states using genetic algorithm with entropy objective.
-    
-    Args:
-        connectivity_penalty: Penalty added per isolated high-conductivity element.
-                             Set to 0 to disable connectivity constraint.
-    """
+    """Global optimization over full element state using a genetic algorithm."""
     rng = np.random.default_rng(seed)
 
     n_var = int(np.count_nonzero(variable_mask))
@@ -255,6 +205,7 @@ def optimize_global_all_elements_ga(
 
     best_state = None
     best_perm = None
+    best_v = None
     best_sensitivity = None
     best_score = np.inf
 
@@ -265,19 +216,20 @@ def optimize_global_all_elements_ga(
         evaluated = []
         for i in range(pop_size):
             state = population[i]
-            perm, sensitivity, score = evaluate_state(
+            perm, v, sensitivity, score = evaluate_state(
                 fwd=fwd,
                 state=state,
                 variable_mask=variable_mask,
                 low_cond=low_cond,
                 high_cond=high_cond,
-                adjacency=adjacency,
-                connectivity_penalty=connectivity_penalty,
+                target=target,
+                sens_norm_scale=sens_norm_scale,
             )
             evaluated.append({
                 "state": state.copy(),
                 "perm": perm,
-                "sensitivity": np.asarray(sensitivity).copy(),
+                "v": np.asarray(v).copy(),
+                "sensitivity": None if sensitivity is None else np.asarray(sensitivity).copy(),
                 "score": float(score),
             })
 
@@ -290,7 +242,8 @@ def optimize_global_all_elements_ga(
             best_score = gen_best_score
             best_state = gen_best["state"].copy()
             best_perm = gen_best["perm"].copy()
-            best_sensitivity = gen_best["sensitivity"].copy()
+            best_v = gen_best["v"].copy()
+            best_sensitivity = None if gen_best["sensitivity"] is None else gen_best["sensitivity"].copy()
 
         best_history.append(float(best_score))
         current_history.append(float(gen_best_score))
@@ -303,11 +256,10 @@ def optimize_global_all_elements_ga(
 
         next_population = []
 
-        # Elitism: carry top individuals unchanged
+        # Elitism: carry top individuals unchanged.
         for i in range(elite_count):
             next_population.append(evaluated[i]["state"].copy())
 
-        # Tournament selection and reproduction
         def tournament_select():
             idxs = rng.choice(pop_size, size=tournament_size, replace=False)
             best_idx = min(idxs, key=lambda idx: evaluated[idx]["score"])
@@ -317,14 +269,12 @@ def optimize_global_all_elements_ga(
             parent_a = tournament_select()
             parent_b = tournament_select()
 
-            # Crossover
             if rng.random() < crossover_rate and n_var > 1:
                 cx = int(rng.integers(1, n_var))
                 child = np.concatenate([parent_a[:cx], parent_b[cx:]])
             else:
                 child = parent_a.copy()
 
-            # Mutation
             if mutation_rate > 0.0:
                 mutation_mask = rng.random(n_var) < mutation_rate
                 child[mutation_mask] = ~child[mutation_mask]
@@ -336,6 +286,7 @@ def optimize_global_all_elements_ga(
     return {
         "best_state": best_state,
         "best_perm": best_perm,
+        "best_v": best_v,
         "best_sensitivity": best_sensitivity,
         "best_score": float(best_score),
         "best_history": np.asarray(best_history, dtype=float),
@@ -349,13 +300,15 @@ def plot_results(
     p1,
     p2,
     best_perm,
+    best_v,
     best_sensitivity,
     best_hist,
     curr_hist,
+    target,
     best_score,
     comparison_rows=None,
 ):
-    """Show best conductivity map, sensitivity distribution, and optimization progress."""
+    """Show best conductivity map, objective output, and optimization progress."""
     pts = mesh_obj.node
     tri = mesh_obj.element
     el_pos = mesh_obj.el_pos
@@ -367,6 +320,7 @@ def plot_results(
         {
             "name": "Best Optimized",
             "perm": best_perm,
+            "v": best_v,
             "sensitivity": best_sensitivity,
             "score": best_score,
         }
@@ -376,7 +330,10 @@ def plot_results(
     if len(rows) == 1:
         axes = np.asarray([axes])
 
-    fig.suptitle("Global Binary Optimization (Entropy Objective)", fontsize=13)
+    if target == "voltage-range":
+        fig.suptitle("Global Binary Optimization (Voltage Range Objective)", fontsize=13)
+    else:
+        fig.suptitle("Global Binary Optimization (Sensitivity Objective)", fontsize=13)
 
     for r, row in enumerate(rows):
         ax0 = axes[r, 0]
@@ -384,7 +341,8 @@ def plot_results(
         ax2 = axes[r, 2]
 
         perm_row = np.asarray(row["perm"]).ravel()
-        sens_row = np.asarray(row["sensitivity"]).ravel()
+        v_row = np.asarray(row["v"]).ravel()
+        sens_row = None if row["sensitivity"] is None else np.asarray(row["sensitivity"]).ravel()
 
         im0 = ax0.tripcolor(xs, ys, tri, perm_row, shading="flat", cmap="RdBu_r")
         ax0.plot(xs[el_pos], ys[el_pos], "ko", markersize=3)
@@ -396,21 +354,28 @@ def plot_results(
         ax0.set_ylabel("y")
         fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04, label="Conductivity")
 
-        im1 = ax1.tripcolor(xs, ys, tri, sens_row, shading="flat", cmap="viridis")
-        ax1.set_aspect("equal")
-        ax1.set_xlim(p1[0] - 0.2, p2[0] + 0.2)
-        ax1.set_ylim(p1[1] - 0.2, p2[1] + 0.2)
-        ax1.set_title(f"{row['name']} Sensitivity")
-        ax1.set_xlabel("x")
-        ax1.set_ylabel("y")
-        fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label="||J[:, elem]||2")
+        if is_sensitivity_uniformity_target(target) and sens_row is not None:
+            im1 = ax1.tripcolor(xs, ys, tri, sens_row, shading="flat", cmap="viridis")
+            ax1.set_aspect("equal")
+            ax1.set_xlim(p1[0] - 0.2, p2[0] + 0.2)
+            ax1.set_ylim(p1[1] - 0.2, p2[1] + 0.2)
+            ax1.set_title(f"{row['name']} Sensitivity")
+            ax1.set_xlabel("x")
+            ax1.set_ylabel("y")
+            fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label="||J[:, elem]||2")
+        else:
+            ax1.plot(np.arange(v_row.size), v_row, linewidth=1.6)
+            ax1.set_title(f"{row['name']} Voltage Output")
+            ax1.set_xlabel("Measurement index")
+            ax1.set_ylabel("Voltage")
+            ax1.grid(True, alpha=0.3)
 
         if r == 0:
             ax2.plot(best_hist, label="Best-so-far score", linewidth=1.8)
             ax2.plot(curr_hist, label="Current score", linewidth=1.0, alpha=0.7)
             ax2.set_title("Optimization Progress")
             ax2.set_xlabel("Iteration")
-            ax2.set_ylabel("Entropy Score")
+            ax2.set_ylabel("Objective score")
             ax2.grid(True, alpha=0.3)
             ax2.legend(loc="best")
         else:
@@ -418,7 +383,7 @@ def plot_results(
             ax2.text(
                 0.03,
                 0.85,
-                f"{row['name']}\nEntropy: {row['score']:.6e}\n"
+                f"{row['name']}\nObjective score: {row['score']:.6e}\n"
                 f"Sensitivity min: {np.min(sens_row):.6e}\n"
                 f"Sensitivity max: {np.max(sens_row):.6e}",
                 va="top",
@@ -436,15 +401,18 @@ def load_config(config_file="config.ini"):
     """Load configuration from INI file."""
     config = configparser.ConfigParser()
     
+    # If config file doesn't exist, create it with defaults
     if not os.path.exists(config_file):
         print(f"Config file {config_file} not found. Creating with defaults...")
         create_default_config(config_file)
     
     config.read(config_file)
     
+    # Parse all configuration values
     cfg = type('Config', (), {})()
     
     # Optimization settings
+    cfg.goal = config.get('optimization', 'goal', fallback='sensitivity-uniformity')
     cfg.generations = config.getint('optimization', 'generations', fallback=100)
     cfg.pop_size = config.getint('optimization', 'pop_size', fallback=24)
     cfg.elite_count = config.getint('optimization', 'elite_count', fallback=2)
@@ -463,13 +431,19 @@ def load_config(config_file="config.ini"):
     # Mesh
     cfg.h0 = config.getfloat('mesh', 'h0', fallback=0.1)
     
+    # Sensitivity
+    sens_norm_scale_str = config.get('sensitivity', 'sens_norm_scale', fallback='').strip()
+    cfg.sens_norm_scale = float(sens_norm_scale_str) if sens_norm_scale_str else None
+    
     return cfg
+
 
 def create_default_config(config_file="config.ini"):
     """Create a default configuration file."""
     config = configparser.ConfigParser()
     
     config['optimization'] = {
+        'goal': 'sensitivity-uniformity',
         'generations': '100',
         'pop_size': '24',
         'elite_count': '2',
@@ -484,16 +458,21 @@ def create_default_config(config_file="config.ini"):
     }
     
     config['conductivity'] = {
-        'low_cond': '100',
-        'high_cond': '10000',
+        'low_cond': '1e-6',
+        'high_cond': '1e6',
     }
     
     config['mesh'] = {
-        'h0': '0.3',
+        'h0': '0.1',
+    }
+    
+    config['sensitivity'] = {
+        'sens_norm_scale': '',
     }
     
     with open(config_file, 'w') as f:
         config.write(f)
+
 
 def run():
     # Load configuration from file
@@ -506,10 +485,25 @@ def run():
 
     print(f"Total elements: {mesh_obj.element.shape[0]}")
     print(f"Optimized variable elements: {np.count_nonzero(variable_mask)}")
-    
-    # Build element adjacency matrix for connectivity constraint
-    adjacency = build_element_adjacency(mesh_obj)
-    print(f"Element adjacency built (mesh has {len(adjacency)} elements)")
+
+    sens_norm_scale = 1.0
+    if is_sensitivity_uniformity_target(args.goal):
+        if args.sens_norm_scale is not None:
+            sens_norm_scale = max(float(args.sens_norm_scale), np.finfo(float).eps)
+        else:
+            # Baseline robust scale from all-low conductivity map.
+            base_state = np.zeros(int(np.count_nonzero(variable_mask)), dtype=bool)
+            _, _, base_sens, _ = evaluate_state(
+                fwd=fwd,
+                state=base_state,
+                variable_mask=variable_mask,
+                low_cond=args.low_cond,
+                high_cond=args.high_cond,
+                target=args.goal,
+                sens_norm_scale=1.0,
+            )
+            sens_norm_scale = max(float(np.percentile(np.abs(base_sens), 90.0)), np.finfo(float).eps)
+        print(f"Sensitivity normalization scale: {sens_norm_scale:.6e}")
 
     # Run genetic algorithm optimization
     if args.pop_size < 10:
@@ -523,6 +517,7 @@ def run():
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
+        target=args.goal,
         generations=args.generations,
         pop_size=args.pop_size,
         elite_count=args.elite_count,
@@ -531,90 +526,100 @@ def run():
         init_high_fraction=args.init_high_fraction,
         tournament_size=args.tournament_size,
         seed=args.seed,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
+        sens_norm_scale=sens_norm_scale,
     )
 
     comparison_rows = []
-    n_var = int(np.count_nonzero(variable_mask))
-    tri = mesh_obj.element
-    pts = mesh_obj.node
-    centroids = np.mean(pts[tri], axis=1)
-    variable_indices = np.where(variable_mask)[0]
+    if is_sensitivity_uniformity_target(args.goal):
+        n_var = int(np.count_nonzero(variable_mask))
+        tri = mesh_obj.element
+        pts = mesh_obj.node
+        centroids = np.mean(pts[tri], axis=1)
+        variable_indices = np.where(variable_mask)[0]
 
-    # Centered low-conductivity rectangle on high-conductivity background
-    cx = 0.5 * (p1[0] + p2[0])
-    cy = 0.5 * (p1[1] + p2[1])
-    rect_w = 0.25 * (p2[0] - p1[0])
-    rect_h = 0.50 * (p2[1] - p1[1])
-    in_center_rect = (
-        (np.abs(centroids[:, 0] - cx) <= rect_w / 2.0)
-        & (np.abs(centroids[:, 1] - cy) <= rect_h / 2.0)
-    )
+        # Build a centered low-conductivity rectangle on a high-conductivity background.
+        cx = 0.5 * (p1[0] + p2[0])
+        cy = 0.5 * (p1[1] + p2[1])
+        rect_w = 0.25 * (p2[0] - p1[0])
+        rect_h = 0.50 * (p2[1] - p1[1])
+        in_center_rect = (
+            (np.abs(centroids[:, 0] - cx) <= rect_w / 2.0)
+            & (np.abs(centroids[:, 1] - cy) <= rect_h / 2.0)
+        )
 
-    middle_low_state = np.ones(n_var, dtype=bool)
-    middle_low_state[in_center_rect[variable_indices]] = False
+        middle_low_state = np.ones(n_var, dtype=bool)
+        middle_low_state[in_center_rect[variable_indices]] = False
 
-    rect_perm, rect_sens, rect_score = evaluate_state(
-        fwd=fwd,
-        state=middle_low_state,
-        variable_mask=variable_mask,
-        low_cond=args.low_cond,
-        high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
-    )
-    comparison_rows.append(
-        {
-            "name": "Center Low Rectangle",
-            "perm": rect_perm,
-            "sensitivity": rect_sens,
-            "score": float(rect_score),
-        }
-    )
+        rect_perm, rect_v, rect_sens, rect_score = evaluate_state(
+            fwd=fwd,
+            state=middle_low_state,
+            variable_mask=variable_mask,
+            low_cond=args.low_cond,
+            high_cond=args.high_cond,
+            target=args.goal,
+            sens_norm_scale=sens_norm_scale,
+        )
+        comparison_rows.append(
+            {
+                "name": "Center Low Rectangle",
+                "perm": rect_perm,
+                "v": rect_v,
+                "sensitivity": rect_sens,
+                "score": float(rect_score),
+            }
+        )
 
-    all_low_state = np.zeros(n_var, dtype=bool)
-    low_perm, low_sens, low_score = evaluate_state(
-        fwd=fwd,
-        state=all_low_state,
-        variable_mask=variable_mask,
-        low_cond=args.low_cond,
-        high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
-    )
-    comparison_rows.append(
-        {
-            "name": "All Low Conductivity",
-            "perm": low_perm,
-            "sensitivity": low_sens,
-            "score": float(low_score),
-        }
-    )
+        all_low_state = np.zeros(n_var, dtype=bool)
+        low_perm, low_v, low_sens, low_score = evaluate_state(
+            fwd=fwd,
+            state=all_low_state,
+            variable_mask=variable_mask,
+            low_cond=args.low_cond,
+            high_cond=args.high_cond,
+            target=args.goal,
+            sens_norm_scale=sens_norm_scale,
+        )
+        comparison_rows.append(
+            {
+                "name": "All Low Conductivity",
+                "perm": low_perm,
+                "v": low_v,
+                "sensitivity": low_sens,
+                "score": float(low_score),
+            }
+        )
 
-    best_sens = np.asarray(result["best_sensitivity"]).ravel()
-    print(f"Minimum entropy found: {result['best_score']:.6e}")
-    print(f"Best sensitivity min: {best_sens.min():.6e}")
-    print(f"Best sensitivity max: {best_sens.max():.6e}")
+    best_v = np.asarray(result["best_v"]).ravel()
+    if args.goal == "voltage-range":
+        print(f"Minimum voltage range found: {result['best_score']:.6e}")
+        print(f"Best absolute voltage min: {best_v.min():.6e}")
+        print(f"Best absolute voltage max: {best_v.max():.6e}")
+    else:
+        best_sens = np.asarray(result["best_sensitivity"]).ravel()
+        mean_sens, std_sens, recomputed_score = sensitivity_objective_components(best_sens, sens_norm_scale)
+        print(f"Minimum sensitivity objective score found: {result['best_score']:.6e}")
+        print(f"Normalized sensitivity mean: {mean_sens:.6e}")
+        print(f"Normalized sensitivity std: {std_sens:.6e}")
+        print(f"Best sensitivity min: {best_sens.min():.6e}")
+        print(f"Best sensitivity max: {best_sens.max():.6e}")
+        print(
+            f"Best sensitivity objective recomputed (uniformity CV): "
+            f"{recomputed_score:.6e}"
+        )
 
     print(f"High elements in best state: {np.count_nonzero(result['best_state'])}")
     print(f"Low elements in best state: {result['n_variable'] - np.count_nonzero(result['best_state'])}")
-    
-    # Check connectivity of best state
-    high_elems = result['best_state']
-    is_connected = has_connected_high_elements(high_elems, adjacency)
-    isolated_count = count_isolated_high_elements(high_elems, adjacency)
-    print(f"High elements connected: {is_connected}")
-    print(f"Isolated high elements: {isolated_count}")
 
     plot_results(
         mesh_obj=mesh_obj,
         p1=p1,
         p2=p2,
         best_perm=result["best_perm"],
+        best_v=result["best_v"],
         best_sensitivity=result["best_sensitivity"],
         best_hist=result["best_history"],
         curr_hist=result["current_history"],
+        target=args.goal,
         best_score=result["best_score"],
         comparison_rows=comparison_rows,
     )

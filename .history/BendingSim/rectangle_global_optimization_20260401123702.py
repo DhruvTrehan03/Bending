@@ -231,15 +231,8 @@ def optimize_global_all_elements_ga(
     init_high_fraction,
     tournament_size,
     seed,
-    adjacency=None,
-    connectivity_penalty=1e6,
 ):
-    """Global optimization of element states using genetic algorithm with entropy objective.
-    
-    Args:
-        connectivity_penalty: Penalty added per isolated high-conductivity element.
-                             Set to 0 to disable connectivity constraint.
-    """
+    """Global optimization of element states using genetic algorithm with entropy objective."""
     rng = np.random.default_rng(seed)
 
     n_var = int(np.count_nonzero(variable_mask))
@@ -271,8 +264,6 @@ def optimize_global_all_elements_ga(
                 variable_mask=variable_mask,
                 low_cond=low_cond,
                 high_cond=high_cond,
-                adjacency=adjacency,
-                connectivity_penalty=connectivity_penalty,
             )
             evaluated.append({
                 "state": state.copy(),
@@ -506,10 +497,6 @@ def run():
 
     print(f"Total elements: {mesh_obj.element.shape[0]}")
     print(f"Optimized variable elements: {np.count_nonzero(variable_mask)}")
-    
-    # Build element adjacency matrix for connectivity constraint
-    adjacency = build_element_adjacency(mesh_obj)
-    print(f"Element adjacency built (mesh has {len(adjacency)} elements)")
 
     # Run genetic algorithm optimization
     if args.pop_size < 10:
@@ -531,8 +518,6 @@ def run():
         init_high_fraction=args.init_high_fraction,
         tournament_size=args.tournament_size,
         seed=args.seed,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
 
     comparison_rows = []
@@ -561,8 +546,6 @@ def run():
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
     comparison_rows.append(
         {
@@ -580,8 +563,6 @@ def run():
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
     comparison_rows.append(
         {
@@ -599,13 +580,6 @@ def run():
 
     print(f"High elements in best state: {np.count_nonzero(result['best_state'])}")
     print(f"Low elements in best state: {result['n_variable'] - np.count_nonzero(result['best_state'])}")
-    
-    # Check connectivity of best state
-    high_elems = result['best_state']
-    is_connected = has_connected_high_elements(high_elems, adjacency)
-    isolated_count = count_isolated_high_elements(high_elems, adjacency)
-    print(f"High elements connected: {is_connected}")
-    print(f"Isolated high elements: {isolated_count}")
 
     plot_results(
         mesh_obj=mesh_obj,

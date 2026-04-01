@@ -72,133 +72,52 @@ def make_permittivity(state_high, variable_mask, low_cond, high_cond):
 
 
 def element_sensitivity_from_jacobian(jacobian):
-    """Calculate element sensitivity as the L1 norm of jacobian columns."""
-    return np.log10(np.sum(np.abs(jacobian), axis=0) + np.finfo(float).tiny)
-
-
-def entropy_score(sensitivity):
-    """Compute Shannon entropy of element sensitivity distribution.
+    """Calculate element sensitivity as the L1 norm of jacobian columns.
     
-    Lower entropy indicates more uniform/concentrated sensitivity across elements.
-    Returns the Shannon entropy: -sum(p * log(p)) where p is a normalized
-    probability distribution of sensitivity values.
+    Returns sensitivity values without log scaling to preserve dynamic range information
+    while avoiding extreme values.
+    """
+    # Use L1 norm without log to avoid extreme values
+    sensitivity = np.sum(np.abs(jacobian), axis=0)
+    # Add small epsilon to avoid zero sensitivity
+    return sensitivity + np.finfo(float).tiny
+
+
+def uniformity_score(sensitivity):
+    """Compute a score that penalizes non-uniform sensitivity distribution.
+    
+    Lower score = more uniform distribution with no extremely low values.
+    Uses coefficient of variation (std/mean) to measure uniformity,
+    penalizes minimum values that are too low relative to mean.
     """
     vals = np.abs(np.asarray(sensitivity).ravel())
-    eps = np.finfo(float).eps
     
-    total = np.sum(vals)
-    if total < eps:
-        return 0.0
+    if len(vals) == 0:
+        return np.inf
     
-    probabilities = vals / total
-    # Only include non-zero probabilities to avoid log(0)
-    entropy = -np.sum(probabilities[probabilities > eps] * np.log(probabilities[probabilities > eps]))
-    mean_sensitivity = np.mean(vals)
-    return float(entropy+mean_sensitivity)
+    mean_val = np.mean(vals)
+    std_val = np.std(vals)
+    min_val = np.min(vals)
+    
+    if mean_val < np.finfo(float).eps:
+        return np.inf
+    
+    # Coefficient of variation (0 = perfectly uniform, >1 = high variation)
+    coeff_of_variation = std_val / mean_val
+    
+    # Penalty for minimum values being too low relative to mean
+    # We want min_val to be close to mean_val (ideally min_val/mean_val ≈ 0.8-1.0)
+    min_ratio = min_val / mean_val
+    min_penalty = max(0, 1.0 - min_ratio) ** 2  # Quadratic penalty
+    
+    # Combined score: favor uniformity AND ensure no extremely low values
+    uniformity_error = coeff_of_variation + 2.0 * min_penalty
+    
+    return float(uniformity_error)
 
 
-def build_element_adjacency(mesh_obj):
-    """Build adjacency matrix for elements based on shared vertices.
-    
-    Two elements are considered adjacent if they share at least 2 vertices (an edge).
-    Returns adjacency as a list of lists where adjacency[i] contains indices of
-    elements adjacent to element i.
-    """
-    tri = mesh_obj.element
-    n_elem = tri.shape[0]
-    adjacency = [[] for _ in range(n_elem)]
-    
-    for i in range(n_elem):
-        vertices_i = set(tri[i])
-        for j in range(i + 1, n_elem):
-            vertices_j = set(tri[j])
-            # Elements are adjacent if they share at least 2 vertices (an edge)
-            if len(vertices_i & vertices_j) >= 2:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    
-    return adjacency
-
-
-def get_connected_components(state_high, adjacency):
-    """Identify connected components of high-conductivity elements.
-    
-    Args:
-        state_high: Boolean array where True indicates high-conductivity element
-        adjacency: Adjacency list where adjacency[i] is list of adjacent elements
-    
-    Returns:
-        List of lists, where each sublist contains indices of elements in a
-        connected component of high-conductivity elements.
-    """
-    n_elem = len(state_high)
-    visited = np.zeros(n_elem, dtype=bool)
-    components = []
-    
-    for start_elem in range(n_elem):
-        if not state_high[start_elem] or visited[start_elem]:
-            continue
-        
-        # BFS to find all connected high-conductivity elements
-        component = []
-        queue = [start_elem]
-        visited[start_elem] = True
-        
-        while queue:
-            elem_idx = queue.pop(0)
-            component.append(elem_idx)
-            
-            for adjacent_elem in adjacency[elem_idx]:
-                if not visited[adjacent_elem] and state_high[adjacent_elem]:
-                    visited[adjacent_elem] = True
-                    queue.append(adjacent_elem)
-        
-        components.append(component)
-    
-    return components
-
-
-def count_isolated_high_elements(state_high, adjacency):
-    """Count number of isolated high-conductivity elements.
-    
-    An element is isolated if it has no high-conductivity neighbors.
-    """
-    isolated_count = 0
-    for i in range(len(state_high)):
-        if state_high[i]:
-            has_high_neighbor = any(state_high[j] for j in adjacency[i])
-            if not has_high_neighbor:
-                isolated_count += 1
-    
-    return isolated_count
-
-
-def has_connected_high_elements(state_high, adjacency):
-    """Check if all high-conductivity elements form a single connected component.
-    
-    Returns True if all high-conductivity elements are connected, False otherwise.
-    If there are no high-conductivity elements or only one, returns True.
-    """
-    n_high = np.sum(state_high)
-    if n_high <= 1:
-        return True
-    
-    components = get_connected_components(state_high, adjacency)
-    return len(components) == 1
-
-
-def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=None, connectivity_penalty=1e6):
-    """Evaluate element state by computing sensitivity entropy with connectivity constraint.
-    
-    Args:
-        fwd: Forward EIT solver
-        state: Boolean array of high/low conductivity state
-        variable_mask: Mask of variable elements
-        low_cond: Low conductivity value
-        high_cond: High conductivity value
-        adjacency: Element adjacency list (optional). If provided, penalty applied for disconnected high elements.
-        connectivity_penalty: Penalty value for each isolated high-conductivity element
-    """
+def evaluate_state(fwd, state, variable_mask, low_cond, high_cond):
+    """Evaluate element state by computing sensitivity uniformity score."""
     perm = make_permittivity(
         state_high=state,
         variable_mask=variable_mask,
@@ -208,12 +127,7 @@ def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=Non
 
     jacobian, _ = fwd.compute_jac(perm=perm)
     sensitivity = element_sensitivity_from_jacobian(jacobian)
-    score = entropy_score(sensitivity)
-    
-    # Apply connectivity constraint penalty
-    if adjacency is not None:
-        isolated_count = count_isolated_high_elements(state, adjacency)
-        score += isolated_count * connectivity_penalty
+    score = uniformity_score(sensitivity)
 
     return perm, sensitivity, score
 
@@ -231,15 +145,8 @@ def optimize_global_all_elements_ga(
     init_high_fraction,
     tournament_size,
     seed,
-    adjacency=None,
-    connectivity_penalty=1e6,
 ):
-    """Global optimization of element states using genetic algorithm with entropy objective.
-    
-    Args:
-        connectivity_penalty: Penalty added per isolated high-conductivity element.
-                             Set to 0 to disable connectivity constraint.
-    """
+    """Global optimization of element states using genetic algorithm with entropy objective."""
     rng = np.random.default_rng(seed)
 
     n_var = int(np.count_nonzero(variable_mask))
@@ -271,8 +178,6 @@ def optimize_global_all_elements_ga(
                 variable_mask=variable_mask,
                 low_cond=low_cond,
                 high_cond=high_cond,
-                adjacency=adjacency,
-                connectivity_penalty=connectivity_penalty,
             )
             evaluated.append({
                 "state": state.copy(),
@@ -376,7 +281,7 @@ def plot_results(
     if len(rows) == 1:
         axes = np.asarray([axes])
 
-    fig.suptitle("Global Binary Optimization (Entropy Objective)", fontsize=13)
+    fig.suptitle("Global Binary Optimization (Uniformity Objective)", fontsize=13)
 
     for r, row in enumerate(rows):
         ax0 = axes[r, 0]
@@ -410,7 +315,7 @@ def plot_results(
             ax2.plot(curr_hist, label="Current score", linewidth=1.0, alpha=0.7)
             ax2.set_title("Optimization Progress")
             ax2.set_xlabel("Iteration")
-            ax2.set_ylabel("Entropy Score")
+            ax2.set_ylabel("Uniformity Score")
             ax2.grid(True, alpha=0.3)
             ax2.legend(loc="best")
         else:
@@ -418,7 +323,7 @@ def plot_results(
             ax2.text(
                 0.03,
                 0.85,
-                f"{row['name']}\nEntropy: {row['score']:.6e}\n"
+                f"{row['name']}\nUniformity: {row['score']:.6e}\n"
                 f"Sensitivity min: {np.min(sens_row):.6e}\n"
                 f"Sensitivity max: {np.max(sens_row):.6e}",
                 va="top",
@@ -506,10 +411,6 @@ def run():
 
     print(f"Total elements: {mesh_obj.element.shape[0]}")
     print(f"Optimized variable elements: {np.count_nonzero(variable_mask)}")
-    
-    # Build element adjacency matrix for connectivity constraint
-    adjacency = build_element_adjacency(mesh_obj)
-    print(f"Element adjacency built (mesh has {len(adjacency)} elements)")
 
     # Run genetic algorithm optimization
     if args.pop_size < 10:
@@ -531,8 +432,6 @@ def run():
         init_high_fraction=args.init_high_fraction,
         tournament_size=args.tournament_size,
         seed=args.seed,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
 
     comparison_rows = []
@@ -561,8 +460,6 @@ def run():
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
     comparison_rows.append(
         {
@@ -580,8 +477,6 @@ def run():
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
     comparison_rows.append(
         {
@@ -593,19 +488,12 @@ def run():
     )
 
     best_sens = np.asarray(result["best_sensitivity"]).ravel()
-    print(f"Minimum entropy found: {result['best_score']:.6e}")
+    print(f"Best uniformity score found: {result['best_score']:.6e}")
     print(f"Best sensitivity min: {best_sens.min():.6e}")
     print(f"Best sensitivity max: {best_sens.max():.6e}")
 
     print(f"High elements in best state: {np.count_nonzero(result['best_state'])}")
     print(f"Low elements in best state: {result['n_variable'] - np.count_nonzero(result['best_state'])}")
-    
-    # Check connectivity of best state
-    high_elems = result['best_state']
-    is_connected = has_connected_high_elements(high_elems, adjacency)
-    isolated_count = count_isolated_high_elements(high_elems, adjacency)
-    print(f"High elements connected: {is_connected}")
-    print(f"Isolated high elements: {isolated_count}")
 
     plot_results(
         mesh_obj=mesh_obj,

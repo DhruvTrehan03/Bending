@@ -72,8 +72,8 @@ def make_permittivity(state_high, variable_mask, low_cond, high_cond):
 
 
 def element_sensitivity_from_jacobian(jacobian):
-    """Calculate element sensitivity as the L1 norm of jacobian columns."""
-    return np.log10(np.sum(np.abs(jacobian), axis=0) + np.finfo(float).tiny)
+    """Calculate element sensitivity as the L2 norm of jacobian columns."""
+    return np.linalg.norm(np.asarray(jacobian), axis=0)
 
 
 def entropy_score(sensitivity):
@@ -93,112 +93,12 @@ def entropy_score(sensitivity):
     probabilities = vals / total
     # Only include non-zero probabilities to avoid log(0)
     entropy = -np.sum(probabilities[probabilities > eps] * np.log(probabilities[probabilities > eps]))
-    mean_sensitivity = np.mean(vals)
-    return float(entropy+mean_sensitivity)
+    
+    return float(entropy)
 
 
-def build_element_adjacency(mesh_obj):
-    """Build adjacency matrix for elements based on shared vertices.
-    
-    Two elements are considered adjacent if they share at least 2 vertices (an edge).
-    Returns adjacency as a list of lists where adjacency[i] contains indices of
-    elements adjacent to element i.
-    """
-    tri = mesh_obj.element
-    n_elem = tri.shape[0]
-    adjacency = [[] for _ in range(n_elem)]
-    
-    for i in range(n_elem):
-        vertices_i = set(tri[i])
-        for j in range(i + 1, n_elem):
-            vertices_j = set(tri[j])
-            # Elements are adjacent if they share at least 2 vertices (an edge)
-            if len(vertices_i & vertices_j) >= 2:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-    
-    return adjacency
-
-
-def get_connected_components(state_high, adjacency):
-    """Identify connected components of high-conductivity elements.
-    
-    Args:
-        state_high: Boolean array where True indicates high-conductivity element
-        adjacency: Adjacency list where adjacency[i] is list of adjacent elements
-    
-    Returns:
-        List of lists, where each sublist contains indices of elements in a
-        connected component of high-conductivity elements.
-    """
-    n_elem = len(state_high)
-    visited = np.zeros(n_elem, dtype=bool)
-    components = []
-    
-    for start_elem in range(n_elem):
-        if not state_high[start_elem] or visited[start_elem]:
-            continue
-        
-        # BFS to find all connected high-conductivity elements
-        component = []
-        queue = [start_elem]
-        visited[start_elem] = True
-        
-        while queue:
-            elem_idx = queue.pop(0)
-            component.append(elem_idx)
-            
-            for adjacent_elem in adjacency[elem_idx]:
-                if not visited[adjacent_elem] and state_high[adjacent_elem]:
-                    visited[adjacent_elem] = True
-                    queue.append(adjacent_elem)
-        
-        components.append(component)
-    
-    return components
-
-
-def count_isolated_high_elements(state_high, adjacency):
-    """Count number of isolated high-conductivity elements.
-    
-    An element is isolated if it has no high-conductivity neighbors.
-    """
-    isolated_count = 0
-    for i in range(len(state_high)):
-        if state_high[i]:
-            has_high_neighbor = any(state_high[j] for j in adjacency[i])
-            if not has_high_neighbor:
-                isolated_count += 1
-    
-    return isolated_count
-
-
-def has_connected_high_elements(state_high, adjacency):
-    """Check if all high-conductivity elements form a single connected component.
-    
-    Returns True if all high-conductivity elements are connected, False otherwise.
-    If there are no high-conductivity elements or only one, returns True.
-    """
-    n_high = np.sum(state_high)
-    if n_high <= 1:
-        return True
-    
-    components = get_connected_components(state_high, adjacency)
-    return len(components) == 1
-
-
-def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=None, connectivity_penalty=1e6):
-    """Evaluate element state by computing sensitivity entropy with connectivity constraint.
-    
-    Args:
-        fwd: Forward EIT solver
-        state: Boolean array of high/low conductivity state
-        variable_mask: Mask of variable elements
-        low_cond: Low conductivity value
-        high_cond: High conductivity value
-        adjacency: Element adjacency list (optional). If provided, penalty applied for disconnected high elements.
-        connectivity_penalty: Penalty value for each isolated high-conductivity element
-    """
+def evaluate_state(fwd, state, variable_mask, low_cond, high_cond):
+    """Evaluate element state by computing sensitivity entropy."""
     perm = make_permittivity(
         state_high=state,
         variable_mask=variable_mask,
@@ -209,11 +109,6 @@ def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=Non
     jacobian, _ = fwd.compute_jac(perm=perm)
     sensitivity = element_sensitivity_from_jacobian(jacobian)
     score = entropy_score(sensitivity)
-    
-    # Apply connectivity constraint penalty
-    if adjacency is not None:
-        isolated_count = count_isolated_high_elements(state, adjacency)
-        score += isolated_count * connectivity_penalty
 
     return perm, sensitivity, score
 
@@ -231,15 +126,8 @@ def optimize_global_all_elements_ga(
     init_high_fraction,
     tournament_size,
     seed,
-    adjacency=None,
-    connectivity_penalty=1e6,
 ):
-    """Global optimization of element states using genetic algorithm with entropy objective.
-    
-    Args:
-        connectivity_penalty: Penalty added per isolated high-conductivity element.
-                             Set to 0 to disable connectivity constraint.
-    """
+    """Global optimization of element states using genetic algorithm with entropy objective."""
     rng = np.random.default_rng(seed)
 
     n_var = int(np.count_nonzero(variable_mask))
@@ -271,8 +159,6 @@ def optimize_global_all_elements_ga(
                 variable_mask=variable_mask,
                 low_cond=low_cond,
                 high_cond=high_cond,
-                adjacency=adjacency,
-                connectivity_penalty=connectivity_penalty,
             )
             evaluated.append({
                 "state": state.copy(),
@@ -465,6 +351,7 @@ def load_config(config_file="config.ini"):
     
     return cfg
 
+
 def create_default_config(config_file="config.ini"):
     """Create a default configuration file."""
     config = configparser.ConfigParser()
@@ -484,16 +371,17 @@ def create_default_config(config_file="config.ini"):
     }
     
     config['conductivity'] = {
-        'low_cond': '100',
-        'high_cond': '10000',
+        'low_cond': '1e-6',
+        'high_cond': '1e6',
     }
     
     config['mesh'] = {
-        'h0': '0.3',
+        'h0': '0.1',
     }
     
     with open(config_file, 'w') as f:
         config.write(f)
+
 
 def run():
     # Load configuration from file
@@ -506,10 +394,6 @@ def run():
 
     print(f"Total elements: {mesh_obj.element.shape[0]}")
     print(f"Optimized variable elements: {np.count_nonzero(variable_mask)}")
-    
-    # Build element adjacency matrix for connectivity constraint
-    adjacency = build_element_adjacency(mesh_obj)
-    print(f"Element adjacency built (mesh has {len(adjacency)} elements)")
 
     # Run genetic algorithm optimization
     if args.pop_size < 10:
@@ -531,8 +415,6 @@ def run():
         init_high_fraction=args.init_high_fraction,
         tournament_size=args.tournament_size,
         seed=args.seed,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
 
     comparison_rows = []
@@ -561,8 +443,6 @@ def run():
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
     comparison_rows.append(
         {
@@ -580,8 +460,6 @@ def run():
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
     )
     comparison_rows.append(
         {
@@ -599,13 +477,6 @@ def run():
 
     print(f"High elements in best state: {np.count_nonzero(result['best_state'])}")
     print(f"Low elements in best state: {result['n_variable'] - np.count_nonzero(result['best_state'])}")
-    
-    # Check connectivity of best state
-    high_elems = result['best_state']
-    is_connected = has_connected_high_elements(high_elems, adjacency)
-    isolated_count = count_isolated_high_elements(high_elems, adjacency)
-    print(f"High elements connected: {is_connected}")
-    print(f"Isolated high elements: {isolated_count}")
 
     plot_results(
         mesh_obj=mesh_obj,
