@@ -61,6 +61,145 @@ def build_model(n_el=16, h0=0.1):
     return mesh_obj, protocol_obj, variable_mask, p1, p2
 
 
+def build_variable_element_geometry(mesh_obj, variable_mask, p1, p2):
+    """Precompute geometry used by the parameterized field-shape model."""
+    tri = mesh_obj.element
+    pts = mesh_obj.node
+    centroids = np.mean(pts[tri], axis=1)[:, :2]
+
+    variable_indices = np.where(variable_mask)[0]
+    variable_centroids = centroids[variable_indices]
+
+    x1, y1 = p1
+    x2, y2 = p2
+    w = x2 - x1
+    h = y2 - y1
+    perimeter = 2.0 * (w + h)
+
+    x = variable_centroids[:, 0]
+    y = variable_centroids[:, 1]
+
+    # Distances to rectangle sides: bottom, right, top, left.
+    dist_to_sides = np.column_stack([
+        y - y1,
+        x2 - x,
+        y2 - y,
+        x - x1,
+    ])
+    nearest_side = np.argmin(dist_to_sides, axis=1)
+    inward_distance = np.take_along_axis(
+        dist_to_sides,
+        nearest_side[:, None],
+        axis=1,
+    ).ravel()
+
+    boundary_s = np.empty(variable_centroids.shape[0], dtype=float)
+
+    mask_bottom = nearest_side == 0
+    boundary_s[mask_bottom] = x[mask_bottom] - x1
+
+    mask_right = nearest_side == 1
+    boundary_s[mask_right] = w + (y[mask_right] - y1)
+
+    mask_top = nearest_side == 2
+    boundary_s[mask_top] = w + h + (x2 - x[mask_top])
+
+    mask_left = nearest_side == 3
+    boundary_s[mask_left] = 2.0 * w + h + (y2 - y[mask_left])
+
+    boundary_u = boundary_s / perimeter
+
+    return {
+        "variable_indices": variable_indices,
+        "centroids": variable_centroids,
+        "boundary_u": boundary_u,
+        "inward_distance": inward_distance,
+        "width": w,
+        "height": h,
+    }
+
+
+def build_electrode_support_elements(mesh_obj, variable_mask, k_nearest=4):
+    """Map each electrode to nearby variable elements for coverage constraints."""
+    tri = mesh_obj.element
+    pts = mesh_obj.node
+    centroids = np.mean(pts[tri], axis=1)[:, :2]
+    variable_indices = np.where(variable_mask)[0]
+    variable_centroids = centroids[variable_indices]
+
+    electrode_points = pts[mesh_obj.el_pos][:, :2]
+    supports = []
+    for ept in electrode_points:
+        d2 = np.sum((variable_centroids - ept) ** 2, axis=1)
+        nearest = np.argsort(d2)[: max(1, int(k_nearest))]
+        supports.append(nearest.astype(int))
+    return supports
+
+
+def parameter_vector_size(rbf_rows, rbf_cols):
+    """Return number of optimized parameters for the RBF level-set model."""
+    return 1 + int(rbf_rows) * int(rbf_cols)
+
+
+def build_rbf_field_geometry(mesh_obj, variable_mask, p1, p2, rbf_rows, rbf_cols, sigma_frac):
+    """Precompute RBF centers and basis values for the implicit shape model."""
+    tri = mesh_obj.element
+    pts = mesh_obj.node
+    centroids = np.mean(pts[tri], axis=1)[:, :2]
+
+    variable_indices = np.where(variable_mask)[0]
+    variable_centroids = centroids[variable_indices]
+
+    x1, y1 = p1
+    x2, y2 = p2
+    width = x2 - x1
+    height = y2 - y1
+
+    rbf_rows = int(max(1, rbf_rows))
+    rbf_cols = int(max(1, rbf_cols))
+
+    xs = np.linspace(x1 + 0.10 * width, x2 - 0.10 * width, rbf_cols)
+    ys = np.linspace(y1 + 0.10 * height, y2 - 0.10 * height, rbf_rows)
+    center_grid = np.array([(x, y) for y in ys for x in xs], dtype=float)
+
+    dx = width / max(1, rbf_cols - 1)
+    dy = height / max(1, rbf_rows - 1)
+    sigma = float(max(1e-9, sigma_frac * min(dx, dy)))
+    sigma2 = 2.0 * sigma * sigma
+
+    deltas = variable_centroids[:, None, :] - center_grid[None, :, :]
+    dist2 = np.sum(deltas * deltas, axis=2)
+    basis = np.exp(-dist2 / sigma2)
+
+    return {
+        "variable_indices": variable_indices,
+        "centroids": variable_centroids,
+        "centers": center_grid,
+        "basis": basis,
+        "sigma": sigma,
+        "width": width,
+        "height": height,
+    }
+
+
+def parameterized_state_from_theta(theta, field_geometry, field_shape_cfg):
+    """Convert RBF parameters into a boolean high-conductivity state."""
+    theta = np.asarray(theta, dtype=float).ravel()
+    n_rows = int(field_shape_cfg["rbf_rows"])
+    n_cols = int(field_shape_cfg["rbf_cols"])
+    expected = parameter_vector_size(n_rows, n_cols)
+    if theta.size != expected:
+        raise ValueError(f"Expected {expected} parameters, got {theta.size}")
+
+    bias = float(np.clip(theta[0], -1.0, 1.0))
+    weights = np.clip(theta[1:], -1.0, 1.0)
+    weight_scale = float(field_shape_cfg["rbf_weight_scale"])
+
+    field = bias + weight_scale * field_geometry["basis"].dot(weights)
+    state_high = field >= 0.0
+    return np.asarray(state_high, dtype=bool), field
+
+
 def make_permittivity(state_high, variable_mask, low_cond, high_cond):
     """Construct element conductivity from a boolean high/low element state."""
     n_elem = variable_mask.size
@@ -187,7 +326,51 @@ def has_connected_high_elements(state_high, adjacency):
     return len(components) == 1
 
 
-def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=None, connectivity_penalty=1e6):
+def electrodes_connected_by_high_region(state_high, adjacency, electrode_supports):
+    """Check that one connected high-conductivity component touches every electrode."""
+    if electrode_supports is None:
+        return has_connected_high_elements(state_high, adjacency)
+
+    components = get_connected_components(state_high, adjacency)
+    if len(components) != 1:
+        return False
+
+    for support in electrode_supports:
+        support = np.asarray(support, dtype=int)
+        if support.size == 0:
+            return False
+        if not np.any(state_high[support]):
+            return False
+
+    return True
+
+
+def enforce_connected_high_elements(state_high, adjacency):
+    """Repair state so high-conductivity elements form at most one component.
+
+    If multiple high components exist, only the largest component is kept and
+    all other high elements are set to low.
+    """
+    state = np.asarray(state_high, dtype=bool).copy()
+    components = get_connected_components(state, adjacency)
+    if len(components) <= 1:
+        return state
+
+    keep = max(components, key=len)
+    repaired = np.zeros_like(state, dtype=bool)
+    repaired[np.asarray(keep, dtype=int)] = True
+    return repaired
+
+
+def evaluate_state(
+    fwd,
+    state,
+    variable_mask,
+    low_cond,
+    high_cond,
+    adjacency=None,
+    electrode_supports=None,
+):
     """Evaluate element state by computing sensitivity entropy with connectivity constraint.
     
     Args:
@@ -196,8 +379,8 @@ def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=Non
         variable_mask: Mask of variable elements
         low_cond: Low conductivity value
         high_cond: High conductivity value
-        adjacency: Element adjacency list (optional). If provided, penalty applied for disconnected high elements.
-        connectivity_penalty: Penalty value for each isolated high-conductivity element
+        adjacency: Element adjacency list (optional). If provided, penalty applied
+            when high-conductivity elements split into multiple components.
     """
     perm = make_permittivity(
         state_high=state,
@@ -206,21 +389,28 @@ def evaluate_state(fwd, state, variable_mask, low_cond, high_cond, adjacency=Non
         high_cond=high_cond,
     )
 
+    # Apply strict connectivity constraint.
+    # High elements must form one connected component.
+    if adjacency is not None and not electrodes_connected_by_high_region(
+        state,
+        adjacency,
+        electrode_supports,
+    ):
+            sensitivity = np.zeros_like(perm, dtype=float)
+            return perm, sensitivity, np.inf
+
     jacobian, _ = fwd.compute_jac(perm=perm)
     sensitivity = element_sensitivity_from_jacobian(jacobian)
     score = entropy_score(sensitivity)
-    
-    # Apply connectivity constraint penalty
-    if adjacency is not None:
-        isolated_count = count_isolated_high_elements(state, adjacency)
-        score += isolated_count * connectivity_penalty
 
     return perm, sensitivity, score
 
 
-def optimize_global_all_elements_ga(
+def optimize_parameterized_field_ga(
     fwd,
     variable_mask,
+    field_geometry,
+    field_shape_cfg,
     low_cond,
     high_cond,
     generations,
@@ -232,17 +422,12 @@ def optimize_global_all_elements_ga(
     tournament_size,
     seed,
     adjacency=None,
-    connectivity_penalty=1e6,
+    electrode_supports=None,
 ):
-    """Global optimization of element states using genetic algorithm with entropy objective.
-    
-    Args:
-        connectivity_penalty: Penalty added per isolated high-conductivity element.
-                             Set to 0 to disable connectivity constraint.
-    """
+    """Optimize parameterized conductivity-field shape with a genetic algorithm."""
     rng = np.random.default_rng(seed)
 
-    n_var = int(np.count_nonzero(variable_mask))
+    n_params = parameter_vector_size(int(field_shape_cfg["rbf_rows"]), int(field_shape_cfg["rbf_cols"]))
     generations = int(max(1, generations))
     pop_size = int(max(4, pop_size))
     elite_count = int(max(1, min(elite_count, pop_size - 1)))
@@ -251,9 +436,21 @@ def optimize_global_all_elements_ga(
     init_high_fraction = float(min(max(init_high_fraction, 0.0), 1.0))
     tournament_size = int(max(2, min(tournament_size, pop_size)))
 
-    population = rng.random((pop_size, n_var)) < init_high_fraction
+    population = rng.normal(loc=0.0, scale=0.25, size=(pop_size, n_params))
+    population[:, 0] = np.clip(
+        rng.normal(loc=float(field_shape_cfg["rbf_bias_init"]), scale=0.20, size=pop_size),
+        -1.0,
+        1.0,
+    )
+    population[:, 1:] = np.clip(
+        rng.normal(loc=0.0, scale=float(field_shape_cfg["rbf_weight_scale"]), size=(pop_size, n_params - 1)),
+        -1.0,
+        1.0,
+    )
 
     best_state = None
+    best_theta = None
+    best_thickness = None
     best_perm = None
     best_sensitivity = None
     best_score = np.inf
@@ -264,7 +461,12 @@ def optimize_global_all_elements_ga(
     for gen in range(1, generations + 1):
         evaluated = []
         for i in range(pop_size):
-            state = population[i]
+            theta = population[i]
+            state, thickness = parameterized_state_from_theta(
+                theta=theta,
+                field_geometry=field_geometry,
+                field_shape_cfg=field_shape_cfg,
+            )
             perm, sensitivity, score = evaluate_state(
                 fwd=fwd,
                 state=state,
@@ -272,10 +474,12 @@ def optimize_global_all_elements_ga(
                 low_cond=low_cond,
                 high_cond=high_cond,
                 adjacency=adjacency,
-                connectivity_penalty=connectivity_penalty,
+                electrode_supports=electrode_supports,
             )
             evaluated.append({
+                "theta": theta.copy(),
                 "state": state.copy(),
+                "field": np.asarray(thickness).copy(),
                 "perm": perm,
                 "sensitivity": np.asarray(sensitivity).copy(),
                 "score": float(score),
@@ -288,7 +492,9 @@ def optimize_global_all_elements_ga(
 
         if gen_best_score < best_score:
             best_score = gen_best_score
+            best_theta = gen_best["theta"].copy()
             best_state = gen_best["state"].copy()
+            best_thickness = gen_best["field"].copy()
             best_perm = gen_best["perm"].copy()
             best_sensitivity = gen_best["sensitivity"].copy()
 
@@ -305,42 +511,47 @@ def optimize_global_all_elements_ga(
 
         # Elitism: carry top individuals unchanged
         for i in range(elite_count):
-            next_population.append(evaluated[i]["state"].copy())
+            next_population.append(evaluated[i]["theta"].copy())
 
         # Tournament selection and reproduction
         def tournament_select():
             idxs = rng.choice(pop_size, size=tournament_size, replace=False)
-            best_idx = min(idxs, key=lambda idx: evaluated[idx]["score"])
-            return evaluated[best_idx]["state"].copy()
+            winner = min(idxs, key=lambda idx: evaluated[idx]["score"])
+            return evaluated[winner]["theta"].copy()
 
         while len(next_population) < pop_size:
             parent_a = tournament_select()
             parent_b = tournament_select()
 
             # Crossover
-            if rng.random() < crossover_rate and n_var > 1:
-                cx = int(rng.integers(1, n_var))
-                child = np.concatenate([parent_a[:cx], parent_b[cx:]])
+            if rng.random() < crossover_rate and n_params > 1:
+                blend = rng.random(n_params)
+                child = blend * parent_a + (1.0 - blend) * parent_b
             else:
                 child = parent_a.copy()
 
             # Mutation
             if mutation_rate > 0.0:
-                mutation_mask = rng.random(n_var) < mutation_rate
-                child[mutation_mask] = ~child[mutation_mask]
+                mutation_mask = rng.random(n_params) < mutation_rate
+                if np.any(mutation_mask):
+                    child[mutation_mask] += rng.normal(loc=0.0, scale=0.25, size=np.count_nonzero(mutation_mask))
+            child = np.clip(child, -1.0, 1.0)
 
             next_population.append(child)
 
-        population = np.asarray(next_population, dtype=bool)
+        population = np.asarray(next_population, dtype=float)
 
     return {
+        "best_theta": best_theta,
         "best_state": best_state,
+        "best_field": best_thickness,
         "best_perm": best_perm,
         "best_sensitivity": best_sensitivity,
         "best_score": float(best_score),
         "best_history": np.asarray(best_history, dtype=float),
         "current_history": np.asarray(current_history, dtype=float),
-        "n_variable": n_var,
+        "n_variable": int(np.count_nonzero(variable_mask)),
+        "n_params": int(n_params),
     }
 
 
@@ -462,6 +673,14 @@ def load_config(config_file="config.ini"):
     
     # Mesh
     cfg.h0 = config.getfloat('mesh', 'h0', fallback=0.1)
+
+    # Field-shape parameterization
+    cfg.rbf_rows = config.getint('field_shape', 'rbf_rows', fallback=4)
+    cfg.rbf_cols = config.getint('field_shape', 'rbf_cols', fallback=5)
+    cfg.rbf_sigma_frac = config.getfloat('field_shape', 'rbf_sigma_frac', fallback=0.90)
+    cfg.rbf_bias_init = config.getfloat('field_shape', 'rbf_bias_init', fallback=0.25)
+    cfg.rbf_weight_scale = config.getfloat('field_shape', 'rbf_weight_scale', fallback=0.35)
+    cfg.electrode_support_k = config.getint('field_shape', 'electrode_support_k', fallback=4)
     
     return cfg
 
@@ -491,6 +710,15 @@ def create_default_config(config_file="config.ini"):
     config['mesh'] = {
         'h0': '0.3',
     }
+
+    config['field_shape'] = {
+        'rbf_rows': '4',
+        'rbf_cols': '5',
+        'rbf_sigma_frac': '0.90',
+        'rbf_bias_init': '0.25',
+        'rbf_weight_scale': '0.35',
+        'electrode_support_k': '4',
+    }
     
     with open(config_file, 'w') as f:
         config.write(f)
@@ -506,10 +734,37 @@ def run():
 
     print(f"Total elements: {mesh_obj.element.shape[0]}")
     print(f"Optimized variable elements: {np.count_nonzero(variable_mask)}")
-    
-    # Build element adjacency matrix for connectivity constraint
+
+    # Build topology used for strict conductivity-path constraints.
     adjacency = build_element_adjacency(mesh_obj)
+    electrode_supports = build_electrode_support_elements(
+        mesh_obj,
+        variable_mask,
+        k_nearest=args.electrode_support_k,
+    )
     print(f"Element adjacency built (mesh has {len(adjacency)} elements)")
+
+    field_geometry = build_rbf_field_geometry(
+        mesh_obj=mesh_obj,
+        variable_mask=variable_mask,
+        p1=p1,
+        p2=p2,
+        rbf_rows=args.rbf_rows,
+        rbf_cols=args.rbf_cols,
+        sigma_frac=args.rbf_sigma_frac,
+    )
+    field_shape_cfg = {
+        "rbf_rows": int(max(1, args.rbf_rows)),
+        "rbf_cols": int(max(1, args.rbf_cols)),
+        "rbf_sigma_frac": float(args.rbf_sigma_frac),
+        "rbf_bias_init": float(args.rbf_bias_init),
+        "rbf_weight_scale": float(args.rbf_weight_scale),
+    }
+    print(
+        "Field shape model: "
+        f"rbf_grid={field_shape_cfg['rbf_rows']}x{field_shape_cfg['rbf_cols']}, "
+        f"sigma_frac={field_shape_cfg['rbf_sigma_frac']:.2f}"
+    )
 
     # Run genetic algorithm optimization
     if args.pop_size < 10:
@@ -518,9 +773,11 @@ def run():
             "consider >= 20 for better global search."
         )
 
-    result = optimize_global_all_elements_ga(
+    result = optimize_parameterized_field_ga(
         fwd=fwd,
         variable_mask=variable_mask,
+        field_geometry=field_geometry,
+        field_shape_cfg=field_shape_cfg,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
         generations=args.generations,
@@ -532,63 +789,29 @@ def run():
         tournament_size=args.tournament_size,
         seed=args.seed,
         adjacency=adjacency,
-        connectivity_penalty=1e6,
+        electrode_supports=electrode_supports,
     )
 
     comparison_rows = []
-    n_var = int(np.count_nonzero(variable_mask))
-    tri = mesh_obj.element
-    pts = mesh_obj.node
-    centroids = np.mean(pts[tri], axis=1)
-    variable_indices = np.where(variable_mask)[0]
 
-    # Centered low-conductivity rectangle on high-conductivity background
-    cx = 0.5 * (p1[0] + p2[0])
-    cy = 0.5 * (p1[1] + p2[1])
-    rect_w = 0.25 * (p2[0] - p1[0])
-    rect_h = 0.50 * (p2[1] - p1[1])
-    in_center_rect = (
-        (np.abs(centroids[:, 0] - cx) <= rect_w / 2.0)
-        & (np.abs(centroids[:, 1] - cy) <= rect_h / 2.0)
-    )
-
-    middle_low_state = np.ones(n_var, dtype=bool)
-    middle_low_state[in_center_rect[variable_indices]] = False
-
-    rect_perm, rect_sens, rect_score = evaluate_state(
+    theta_ref = np.zeros(parameter_vector_size(field_shape_cfg["rbf_rows"], field_shape_cfg["rbf_cols"]), dtype=float)
+    theta_ref[0] = np.clip(field_shape_cfg["rbf_bias_init"], -1.0, 1.0)
+    ref_state, ref_field = parameterized_state_from_theta(theta_ref, field_geometry, field_shape_cfg)
+    ref_perm, ref_sens, ref_score = evaluate_state(
         fwd=fwd,
-        state=middle_low_state,
+        state=ref_state,
         variable_mask=variable_mask,
         low_cond=args.low_cond,
         high_cond=args.high_cond,
         adjacency=adjacency,
-        connectivity_penalty=1e6,
+        electrode_supports=electrode_supports,
     )
     comparison_rows.append(
         {
-            "name": "Center Low Rectangle",
-            "perm": rect_perm,
-            "sensitivity": rect_sens,
-            "score": float(rect_score),
-        }
-    )
-
-    all_low_state = np.zeros(n_var, dtype=bool)
-    low_perm, low_sens, low_score = evaluate_state(
-        fwd=fwd,
-        state=all_low_state,
-        variable_mask=variable_mask,
-        low_cond=args.low_cond,
-        high_cond=args.high_cond,
-        adjacency=adjacency,
-        connectivity_penalty=1e6,
-    )
-    comparison_rows.append(
-        {
-            "name": "All Low Conductivity",
-            "perm": low_perm,
-            "sensitivity": low_sens,
-            "score": float(low_score),
+            "name": "Uniform RBF Reference",
+            "perm": ref_perm,
+            "sensitivity": ref_sens,
+            "score": float(ref_score),
         }
     )
 
@@ -596,6 +819,7 @@ def run():
     print(f"Minimum entropy found: {result['best_score']:.6e}")
     print(f"Best sensitivity min: {best_sens.min():.6e}")
     print(f"Best sensitivity max: {best_sens.max():.6e}")
+    print(f"Optimized field-shape parameters: {result['n_params']}")
 
     print(f"High elements in best state: {np.count_nonzero(result['best_state'])}")
     print(f"Low elements in best state: {result['n_variable'] - np.count_nonzero(result['best_state'])}")
@@ -603,8 +827,12 @@ def run():
     # Check connectivity of best state
     high_elems = result['best_state']
     is_connected = has_connected_high_elements(high_elems, adjacency)
+    electrodes_linked = electrodes_connected_by_high_region(high_elems, adjacency, electrode_supports)
+    high_components = get_connected_components(high_elems, adjacency)
     isolated_count = count_isolated_high_elements(high_elems, adjacency)
     print(f"High elements connected: {is_connected}")
+    print(f"All electrodes connected by high region: {electrodes_linked}")
+    print(f"High connected components: {len(high_components)}")
     print(f"Isolated high elements: {isolated_count}")
 
     plot_results(

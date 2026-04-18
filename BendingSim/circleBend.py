@@ -31,19 +31,25 @@ mesh_b = mesh.create(
     fd=circle,
     bbox=[[-1.0, -1.0], [1.0, 1.0]],
 )
-
+    im2 = axes2[0].tripcolor(xs, ys, tri, sens_ad, shading="flat", cmap="viridis", norm=sens_norm)
 """ 1. Protocol """
 proto_a = protocol.create(n_el, dist_exc=8, step_meas=1, parser_meas="rotate_meas")
 proto_b = protocol.create(n_el, dist_exc=8, step_meas=1, parser_meas="rotate_meas")
-
+    axes2[0].set_xlabel("x")
+    axes2[0].set_ylabel("y")
+    plt.colorbar(im2, ax=axes2[0], label="Aggregate sensitivity |J|")
 """ 2. Permittivity arrays """
-pts_a, tri_a = mesh_a.node, mesh_a.element
+    im3 = axes2[1].tripcolor(xs, ys, tri, sens_op, shading="flat", cmap="viridis", norm=sens_norm)
 pts_b, tri_b = mesh_b.node, mesh_b.element
 el_pos_a, el_pos_b = mesh_a.el_pos, mesh_b.el_pos
 
-# Mesh A: uniform background
+    axes2[1].set_xlabel("x")
+    axes2[1].set_ylabel("y")
+    plt.colorbar(im3, ax=axes2[1], label="Aggregate sensitivity |J|")
 perm_a = np.full(tri_a.shape[0], 1.0)
 
+    fig2.savefig("circleBend_sensitivity.png", dpi=160, bbox_inches="tight")
+    print("Saved sensitivity map: circleBend_sensitivity.png")
 # Mesh B: rectangular middle inclusion with high or low conductivity
 # Rectangle passes through the gap between electrodes 0 and 1 (and opposite gap)
 # at an angle, not touching any electrode.
