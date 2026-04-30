@@ -1,0 +1,73 @@
+{
+  "run_name": "de_balanced_20260423_130625",
+  "optimizer": "de",
+  "benchmark_name": "balanced",
+  "benchmark_profile": "balanced",
+  "benchmark_weights": {
+    "entropy": 1.0,
+    "isolated_penalty": 0.2,
+    "disconnected_penalty": 5.0
+  },
+  "seed": 7,
+  "h0": 0.1,
+  "low_cond": 1000.0,
+  "high_cond": 500.0,
+  "n_elements": 2262,
+  "n_electrodes": 16,
+  "best_score": 14.584403822455105,
+  "best_sensitivity_min": -8.205554220922739,
+  "best_sensitivity_max": -5.875415549628042,
+  "p1": [
+    0.0,
+    0.0
+  ],
+  "p2": [
+    5.0,
+    2.0
+  ],
+  "connectivity": {
+    "high_elements_connected": true,
+    "electrodes_connected_by_high_region": true,
+    "high_connected_components": 1,
+    "isolated_high_elements": 0
+  },
+  "field_shape_cfg": {
+    "model": "fractal",
+    "rbf_rows": 4,
+    "rbf_cols": 5,
+    "rbf_sigma_frac": 0.9,
+    "rbf_bias_init": 0.25,
+    "rbf_weight_scale": 0.35,
+    "fractal_iter_max": 50,
+    "fractal_type": "branching",
+    "fractal_power": 3,
+    "fractal_shift_frac": 1.0,
+    "fractal_threshold_init": 0.0,
+    "fractal_center_origin": true,
+    "branching_depth_max": 5,
+    "branching_angle_frac": 0.34,
+    "branching_length_decay": 0.68,
+    "branching_width_frac": 0.12,
+    "branching_width_decay": 0.8,
+    "branching_mirror_vertical": true,
+    "branching_aim_electrodes": true,
+    "branching_target_blend": 0.55,
+    "branching_root_x_frac": 0.18,
+    "branching_root_y_frac": 0.0,
+    "branching_seed_all_electrodes": true,
+    "branching_force_meet_center": false,
+    "branching_meet_x_frac": 0.0,
+    "branching_meet_y_frac": 0.0,
+    "branching_meet_blend": 0.75,
+    "branching_random_angle_frac": 0.0,
+    "branching_random_center_boost": 2.2,
+    "branching_random_center_power": 2.0,
+    "branching_force_touch_all_electrodes": true
+  },
+  "artifact_files": {
+    "npz": "de_balanced_20260423_130625.npz",
+    "metadata_json": "de_balanced_20260423_130625.json",
+    "history_csv": "de_balanced_20260423_130625_history.csv",
+    "elements_csv": "de_balanced_20260423_130625_elements.csv"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "source_npz": "C:\\Users\\dhruv\\Bending\\results\\smoke_verify.npz",
+  "benchmark_name": "balanced",
+  "n_elements": 179,
+  "n_high_elements": 177,
+  "score": 10.961028326042642,
+  "sensitivity_min": -6.83493152682211,
+  "sensitivity_max": -5.242566522324521,
+  "sensitivity_mean": -5.774464189935743,
+  "isolated_high_elements": 0,
+  "high_elements_connected": true
+}

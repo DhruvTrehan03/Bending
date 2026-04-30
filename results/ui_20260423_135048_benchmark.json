@@ -1,0 +1,12 @@
+{
+  "source_npz": "C:\\Users\\dhruv\\Bending\\results\\ui_20260423_135048.npz",
+  "benchmark_name": "balanced",
+  "n_elements": 2262,
+  "n_high_elements": 133,
+  "score": 6.8,
+  "sensitivity_min": 0.0,
+  "sensitivity_max": 0.0,
+  "sensitivity_mean": 0.0,
+  "isolated_high_elements": 9,
+  "high_elements_connected": false
+}

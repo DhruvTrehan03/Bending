@@ -1,0 +1,12 @@
+{
+  "source_npz": "C:\\Users\\dhruv\\Bending\\results\\de_uniformity_20260423_131551.npz",
+  "benchmark_name": "balanced",
+  "n_elements": 2262,
+  "n_high_elements": 2262,
+  "score": 14.584403822455105,
+  "sensitivity_min": -8.205554220922739,
+  "sensitivity_max": -5.875415549628042,
+  "sensitivity_mean": -6.860924273187295,
+  "isolated_high_elements": 0,
+  "high_elements_connected": true
+}

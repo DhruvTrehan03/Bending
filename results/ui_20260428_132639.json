@@ -1,0 +1,50 @@
+{
+  "run_name": "ui_20260428_132639",
+  "optimizer": "de",
+  "benchmark_name": "sensitivity_uniformity",
+  "benchmark_profile": "sensitivity_uniformity",
+  "benchmark_weights": {
+    "entropy": 0.0,
+    "isolated_penalty": 0.0,
+    "disconnected_penalty": 0.0
+  },
+  "seed": 7,
+  "h0": 0.3,
+  "low_cond": 100.0,
+  "high_cond": 500.0,
+  "n_elements": 240,
+  "n_electrodes": 16,
+  "best_score": Infinity,
+  "best_sensitivity_min": 0.0,
+  "best_sensitivity_max": 0.0,
+  "p1": [
+    0.0,
+    0.0
+  ],
+  "p2": [
+    5.0,
+    2.0
+  ],
+  "connectivity": {
+    "high_elements_connected": false,
+    "electrodes_connected_by_high_region": false,
+    "high_connected_components": 2,
+    "isolated_high_elements": 1
+  },
+  "field_shape_cfg": {
+    "model": "branching",
+    "branching_depth_max": 5,
+    "branching_max_children": 2,
+    "branching_angle_frac": 0.34,
+    "branching_child_angle_frac": 0.34,
+    "branching_size_min_frac": 0.55,
+    "branching_size_max_frac": 1.0,
+    "branching_seed_all_electrodes": true
+  },
+  "artifact_files": {
+    "npz": "ui_20260428_132639.npz",
+    "metadata_json": "ui_20260428_132639.json",
+    "history_csv": "ui_20260428_132639_history.csv",
+    "elements_csv": "ui_20260428_132639_elements.csv"
+  }
+}
