@@ -648,18 +648,7 @@ def make_permittivity(state_high: np.ndarray, variable_mask: np.ndarray, low_con
 
 
 def element_sensitivity_from_jacobian(jacobian: np.ndarray) -> np.ndarray:
-    """Compute per-element sensitivity as sum of absolute Jacobian values.
-    
-    Uses raw sensitivity (not log-scaled) to match benchmarking.py calculations
-    and provide better visualization of actual element sensitivities.
-    
-    Args:
-        jacobian: Array of shape (n_measurements, n_elements)
-    
-    Returns:
-        Per-element sensitivity: Array of shape (n_elements,)
-    """
-    return np.sum(np.abs(np.asarray(jacobian, dtype=float)), axis=0)
+    return np.log10(np.sum(np.abs(np.asarray(jacobian, dtype=float)), axis=0) + np.finfo(float).tiny)
 
 
 def get_connected_components(state_high: np.ndarray, adjacency: list[list[int]]) -> list[list[int]]:
