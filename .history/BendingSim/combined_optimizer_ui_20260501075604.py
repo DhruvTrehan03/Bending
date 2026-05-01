@@ -668,15 +668,6 @@ def sensitivity_for_display(sensitivity: np.ndarray) -> np.ndarray:
     return np.log10(vals + np.finfo(float).tiny)
 
 
-def compute_reference_sensitivity(mesh_obj: Any, protocol_obj: Any) -> np.ndarray:
-    """Compute baseline sensitivity from a uniform conductivity field (test-script path)."""
-    n_elem = int(np.asarray(mesh_obj.element).shape[0])
-    perm_uniform = np.ones(n_elem, dtype=float)
-    fwd = EITForward(mesh_obj, protocol_obj)
-    jacobian, _ = fwd.compute_jac(perm=perm_uniform)
-    return element_sensitivity_from_jacobian(jacobian)
-
-
 def get_connected_components(state_high: np.ndarray, adjacency: list[list[int]]) -> list[list[int]]:
     state_high = np.asarray(state_high, dtype=bool)
     visited = np.zeros(state_high.size, dtype=bool)
@@ -1350,7 +1341,6 @@ class CombinedOptimizerUI:
         self.last_saved_npz_path: str | None = None
         self.live_best_history: list[float] = []
         self.live_current_history: list[float] = []
-        self.reference_sensitivity: np.ndarray | None = None
         self.mesh_colorbar = None
         self.sensitivity_colorbar = None
         self.biomimetic_thread: threading.Thread | None = None
@@ -2081,7 +2071,6 @@ class CombinedOptimizerUI:
 
         try:
             self.mesh_obj, self.protocol_obj, self.variable_mask, p1_built, p2_built = build_model(n_el=n_el, h0=h0, p1=p1, p2=p2)
-            self.reference_sensitivity = compute_reference_sensitivity(self.mesh_obj, self.protocol_obj)
             self.context = None
             self.optimization_result = None
             self.latest_progress = None
@@ -2369,13 +2358,8 @@ class CombinedOptimizerUI:
         self.ax_mesh.legend(loc="upper right")
 
         self.ax_sensitivity.clear()
-        # Prefer live sensitivity from the current optimization snapshot.
-        # Fall back to the precomputed reference map only when no live state exists yet.
-        source_sensitivity = best_sensitivity if best_sensitivity is not None else self.reference_sensitivity
-        display_baseline = best_sensitivity is None and self.reference_sensitivity is not None
-
-        if source_sensitivity is not None:
-            sens = np.asarray(source_sensitivity, dtype=float).ravel()
+        if best_sensitivity is not None:
+            sens = np.asarray(best_sensitivity, dtype=float).ravel()
             if sens.size == tri.shape[0]:
                 sens_display = sensitivity_for_display(sens)
                 im_sens = self.ax_sensitivity.tripcolor(pts[:, 0], pts[:, 1], tri, sens_display, shading="flat", cmap="viridis")
@@ -2388,11 +2372,7 @@ class CombinedOptimizerUI:
         if el_pos.size:
             self.ax_sensitivity.scatter(pts[el_pos, 0], pts[el_pos, 1], c="#111111", s=24, zorder=3, label="Electrodes")
         self.ax_sensitivity.set_aspect("equal")
-        self.ax_sensitivity.set_title(
-            "Reference sensitivity (uniform perm, log10 display)"
-            if display_baseline
-            else "Live sensitivity (log10 display)"
-        )
+        self.ax_sensitivity.set_title("Live sensitivity (log10 display)")
         self.ax_sensitivity.set_xlabel("x")
         self.ax_sensitivity.set_ylabel("y")
         self.ax_sensitivity.grid(alpha=0.15)

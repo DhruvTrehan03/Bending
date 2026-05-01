@@ -1,0 +1,39 @@
+{
+  "run_name": "ui_20260501_080413",
+  "optimizer": "de",
+  "benchmark_name": "uniformity",
+  "benchmark_profile": "uniformity",
+  "benchmark_weights": {
+    "uniformity_weight": 1.0,
+    "touch_radius": 0.3,
+    "touch_samples": 200.0,
+    "touch_temperature": 1.0,
+    "touch_lambda": 0.1
+  },
+  "seed": 7,
+  "h0": 0.1,
+  "low_cond": 500.0,
+  "high_cond": 1000.0,
+  "n_elements": 2262,
+  "n_electrodes": 16,
+  "best_score": Infinity,
+  "best_sensitivity_min": 0.0,
+  "best_sensitivity_max": 0.0,
+  "p1": [
+    0.0,
+    0.0
+  ],
+  "p2": [
+    5.0,
+    2.0
+  ],
+  "connectivity": {
+    "high_elements_connected": false,
+    "electrodes_connected_by_high_region": false,
+    "high_connected_components": 322,
+    "isolated_high_elements": 169
+  },
+  "field_shape_cfg": {
+    "model": "element"
+  }
+}

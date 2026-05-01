@@ -23,7 +23,7 @@ print("\nSetting up FEM forward...")
 fwd = EITForward(mesh_obj, protocol_obj)
 
 # Create a simple test conductivity
-n_elem = mesh_obj.n_elems
+n_elem = mesh_obj.elements
 perm_uniform = np.ones(n_elem, dtype=float)  # All uniform
 
 print(f"\nComputing Jacobian...")

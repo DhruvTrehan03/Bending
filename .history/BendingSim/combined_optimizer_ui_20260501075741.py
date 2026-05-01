@@ -2369,10 +2369,8 @@ class CombinedOptimizerUI:
         self.ax_mesh.legend(loc="upper right")
 
         self.ax_sensitivity.clear()
-        # Prefer live sensitivity from the current optimization snapshot.
-        # Fall back to the precomputed reference map only when no live state exists yet.
-        source_sensitivity = best_sensitivity if best_sensitivity is not None else self.reference_sensitivity
-        display_baseline = best_sensitivity is None and self.reference_sensitivity is not None
+        display_baseline = self.metric_option_var.get().strip().lower() == "uniformity" and self.reference_sensitivity is not None
+        source_sensitivity = self.reference_sensitivity if display_baseline else best_sensitivity
 
         if source_sensitivity is not None:
             sens = np.asarray(source_sensitivity, dtype=float).ravel()
