@@ -604,6 +604,19 @@ def evaluate_state(
     # Apply connectivity repair if enabled (constrains search space to connected solutions only)
     if repair_disconnected and adjacency is not None:
         state_full = repair_disconnected_state(state_full, adjacency)
+
+    # Ensure each electrode support has at least one high element when supports provided.
+    # If repair_disconnected is enabled we add a support element to touch the high region;
+    # otherwise this will be caught by the connectivity enforcement below.
+    if electrode_supports is not None:
+        for support in electrode_supports:
+            support = np.asarray(support, dtype=int)
+            if support.size == 0:
+                continue
+            if not np.any(state_full[support]):
+                if repair_disconnected and adjacency is not None:
+                    # Mark the first support element as high to ensure electrode is touched
+                    state_full[support[0]] = True
     
     perm = make_permittivity(
         state_high=state_full,

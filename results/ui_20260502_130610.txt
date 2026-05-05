@@ -1,0 +1,60 @@
+================================================================================
+ANALYTICAL RECONSTRUCTION BENCHMARK REPORT
+================================================================================
+
+Mesh: C:/Users/dhruv/Bending/results/ui_20260502_130610.npz
+Elements: 2262
+Nodes: 1205
+Electrodes: 16
+
+--------------------------------------------------------------------------------
+TOUCH POINT LOCALIZATION (at varying distances from edge)
+--------------------------------------------------------------------------------
+
+DISTANCE_0.2
+  Correlation:  0.0067
+  L2 Error:     0.1535
+  SNR (dB):     0.96
+  Localization: 0.0006
+
+DISTANCE_0.5
+  Correlation:  -0.0006
+  L2 Error:     0.1536
+  SNR (dB):     -0.10
+  Localization: 0.0004
+
+DISTANCE_0.8
+  Correlation:  -0.0062
+  L2 Error:     0.1537
+  SNR (dB):     -1.12
+  Localization: 0.0003
+
+--------------------------------------------------------------------------------
+GEOMETRIC SHAPE RECOVERY
+--------------------------------------------------------------------------------
+
+CROSS
+  Correlation:  -0.0618
+  L2 Error:     0.1522
+  SNR (dB):     -0.56
+  Localization: 0.1607
+
+STAR
+  Correlation:  -0.0537
+  L2 Error:     0.1523
+  SNR (dB):     -1.20
+  Localization: 0.0230
+
+C_SHAPE
+  Correlation:  -0.0319
+  L2 Error:     0.1523
+  SNR (dB):     -1.25
+  Localization: 0.0073
+
+================================================================================
+INTERPRETATION:
+  Correlation:   How well sensitivity matches synthetic pattern (-1 to 1, higher is better)
+  L2 Error:      Root mean squared difference (lower is better)
+  SNR (dB):      Signal-to-noise ratio in target region (higher is better)
+  Localization:  Fraction of sensitivity within target (0 to 1, higher is better)
+================================================================================

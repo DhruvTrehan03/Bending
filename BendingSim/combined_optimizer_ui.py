@@ -404,10 +404,16 @@ def branching_parameter_vector_size(field_shape_cfg: dict[str, Any]) -> int:
     return 3 * node_count
 
 
-def parameter_vector_size_from_cfg(field_shape_cfg: dict[str, Any], field_geometry: dict[str, Any] | None = None) -> int:
+def parameter_vector_size_from_cfg(
+    field_shape_cfg: dict[str, Any],
+    field_geometry: dict[str, Any] | None = None,
+) -> int:
     model = str(field_shape_cfg.get("model", "element")).strip().lower()
     if model in {"branching", "fungal"}:
         return branching_parameter_vector_size(field_shape_cfg)
+    if model == "patch_expansion":
+        # one θ value per growth step
+        return int(field_shape_cfg.get("patch_n_growth_steps", 200))
     if model == "element":
         if field_geometry is not None and "n_variable_elements" in field_geometry:
             return int(field_geometry["n_variable_elements"])
@@ -553,7 +559,7 @@ def _evaluate_branching_tree_field_from_normalized_coords(
 
     if np.max(strength) > 0.0:
         strength = strength / np.max(strength)
-    return strength - 0.5
+    return strength - 0.3
 
 
 def build_branching_field_geometry(mesh_obj: Any, variable_mask: np.ndarray, p1: list[float], p2: list[float]) -> dict[str, Any]:
@@ -585,26 +591,191 @@ def build_branching_field_geometry(mesh_obj: Any, variable_mask: np.ndarray, p1:
     }
 
 
-def build_field_geometry(mesh_obj: Any, variable_mask: np.ndarray, p1: list[float], p2: list[float], field_shape_cfg: dict[str, Any]) -> dict[str, Any]:
+def build_field_geometry(
+    mesh_obj, variable_mask, p1, p2, field_shape_cfg, adjacency=None, electrode_supports=None
+) -> dict[str, Any]:
     model = str(field_shape_cfg.get("model", "element")).strip().lower()
     if model in {"branching", "fungal"}:
         return build_branching_field_geometry(mesh_obj, variable_mask, p1, p2)
+    if model == "patch_expansion":
+        if adjacency is None or electrode_supports is None:
+            raise ValueError("patch_expansion needs adjacency and electrode_supports.")
+        n_steps = int(field_shape_cfg.get("patch_n_growth_steps", 200))
+        frontier_batch_size = int(max(1, field_shape_cfg.get("patch_frontier_batch_size", 1)))
+        return build_patch_expansion_geometry(
+            mesh_obj,
+            variable_mask,
+            adjacency,
+            electrode_supports,
+            n_steps,
+            frontier_batch_size=frontier_batch_size,
+        )
     if model == "element":
         tri = np.asarray(mesh_obj.element, dtype=int)
-        pts = np.asarray(mesh_obj.node, dtype=float)
+        pts = np.asarray(mesh_obj.node,    dtype=float)
         return {
             "n_variable_elements": int(np.sum(variable_mask)),
             "centroids": np.mean(pts[tri], axis=1)[:, :2],
         }
     raise ValueError(f"Unsupported field-shape model: {model}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PATCH EXPANSION MODEL
+# Each connected patch (seeded from electrode-touching elements) grows by
+# choosing a frontier batch per iteration. The parameter vector θ is a flat
+# array of values in [-1, 1]; at each growth step, θ[t] maps to a center index
+# in the sorted frontier and the top-k nearest frontier elements are selected.
+# This makes the model fully differentiable w.r.t. DE and
+# guarantees every electrode is always connected.
+# ─────────────────────────────────────────────────────────────────────────────
 
-def parameterized_state_from_theta(theta: np.ndarray, field_geometry: dict[str, Any], field_shape_cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+def build_patch_expansion_geometry(
+    mesh_obj: Any,
+    variable_mask: np.ndarray,
+    adjacency: list[list[int]],
+    electrode_supports: list[np.ndarray],
+    n_growth_steps: int,
+    frontier_batch_size: int = 1,
+) -> dict[str, Any]:
+    """
+    Pre-compute the expansion order graph used by the patch expansion model.
+
+    Seeds are the variable elements that touch any electrode support. From
+    those seeds, we BFS-expand the frontier to enumerate every possible
+    (step, frontier_element) pair up to n_growth_steps. The parameter vector
+    has one entry per growth step. θ[t] ∈ [-1,1] defines a center index in the
+    sorted frontier; the top-k nearest frontier elements are activated at step t.
+
+    Returns a geometry dict consumed by parameterized_state_from_theta.
+    """
+    tri    = np.asarray(mesh_obj.element, dtype=int)
+    pts    = np.asarray(mesh_obj.node,    dtype=float)
+    centroids = np.mean(pts[tri], axis=1)[:, :2]
+    variable_indices = np.where(np.asarray(variable_mask, dtype=bool))[0]
+    var_set = set(variable_indices.tolist())
+
+    # ── seed: variable elements adjacent to any electrode support ────────────
+    seed_set: set[int] = set()
+    for support in electrode_supports:
+        for idx in np.asarray(support, dtype=int):
+            if idx in var_set:
+                seed_set.add(int(idx))
+            # also pull in variable neighbours of the support element
+            for nb in adjacency[idx]:
+                if nb in var_set:
+                    seed_set.add(nb)
+
+    if not seed_set:
+        seed_set = {int(variable_indices[0])}  # fallback
+
+    return {
+        "model": "patch_expansion",
+        "variable_indices": variable_indices,
+        "centroids": centroids,
+        "adjacency": adjacency,
+        "var_set": var_set,
+        "seed_set": seed_set,
+        "n_growth_steps": int(n_growth_steps),
+        "frontier_batch_size": int(max(1, frontier_batch_size)),
+        "n_variable_elements": int(variable_indices.size),
+    }
+
+
+def _expand_patches(
+    seed_set: set[int],
+    var_set: set[int],
+    adjacency: list[list[int]],
+    theta: np.ndarray,
+    n_growth_steps: int,
+    frontier_batch_size: int = 1,
+) -> set[int]:
+    high = set(seed_set)
+    theta = np.asarray(theta, dtype=float).ravel()
+
+    # Pre-build adjacency as a list of numpy arrays for fast lookup
+    # (do this once in geometry, not here — but this helps too)
+    frontier_set: set[int] = set()
+
+    # Initialise frontier from seeds
+    for h in seed_set:
+        for nb in adjacency[h]:
+            if nb in var_set and nb not in high:
+                frontier_set.add(nb)
+
+    for t in range(min(n_growth_steps, theta.size)):
+        if not frontier_set:
+            break
+
+        frontier = sorted(frontier_set)  # deterministic
+        raw_idx = (theta[t] + 1.0) / 2.0 * (len(frontier) - 1)
+        indices = np.arange(len(frontier), dtype=float)
+        rank = np.argsort(np.abs(indices - raw_idx), kind="stable")
+        k = int(max(1, min(frontier_batch_size, len(frontier))))
+        chosen_batch = [frontier[int(i)] for i in rank[:k]]
+
+        for chosen in chosen_batch:
+            high.add(chosen)
+            frontier_set.discard(chosen)
+
+            # Only update frontier with neighbours of the newly added element
+            # instead of recomputing the entire frontier from scratch each step
+            for nb in adjacency[chosen]:
+                if nb in var_set and nb not in high:
+                    frontier_set.add(nb)
+
+    return high
+
+
+def parameterized_state_patch_expansion(
+    theta: np.ndarray,
+    field_geometry: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert a DE parameter vector to a mesh-wide boolean state and a
+    continuous field, using the patch expansion model.
+
+    theta has length n_growth_steps. Each entry defines a center index in the
+    current sorted frontier; the model activates the top-k nearest neighbours
+    to that index at the same growth step.
+    """
+    seed_set       = field_geometry["seed_set"]
+    var_set        = field_geometry["var_set"]
+    adjacency      = field_geometry["adjacency"]
+    n_growth_steps = field_geometry["n_growth_steps"]
+    frontier_batch_size = int(max(1, field_geometry.get("frontier_batch_size", 1)))
+    n_total        = field_geometry["n_variable_elements"]
+    variable_indices = field_geometry["variable_indices"]
+
+    high_global = _expand_patches(
+        seed_set,
+        var_set,
+        adjacency,
+        theta,
+        n_growth_steps,
+        frontier_batch_size=frontier_batch_size,
+    )
+
+    # Build boolean state over variable elements only
+    state_var = np.zeros(n_total, dtype=bool)
+    for i, vi in enumerate(variable_indices):
+        if vi in high_global:
+            state_var[i] = True
+
+    # Continuous field: +0.5 for high, -0.5 for low (matches branching convention)
+    field_var = np.where(state_var, 0.5, -0.5).astype(float)
+
+    return state_var, field_var
+
+def parameterized_state_from_theta(
+    theta: np.ndarray,
+    field_geometry: dict[str, Any],
+    field_shape_cfg: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
     model = str(field_shape_cfg.get("model", "element")).strip().lower()
     theta = np.asarray(theta, dtype=float).ravel()
-    expected = parameter_vector_size_from_cfg(field_shape_cfg, field_geometry)
-    if theta.size != expected:
-        raise ValueError(f"Expected {expected} parameters, got {theta.size}")
+
+    if model == "patch_expansion":
+        return parameterized_state_patch_expansion(theta, field_geometry)
 
     if model in {"branching", "fungal"}:
         field = _evaluate_branching_tree_field_from_normalized_coords(
@@ -854,26 +1025,49 @@ def benchmark_combined(sensitivity, state, adjacency=None, weights=None, jacobia
 
 
 def evaluate_state(
-    fwd: EITForward,
-    state: np.ndarray,
-    variable_mask: np.ndarray,
-    low_cond: float,
-    high_cond: float,
-    adjacency: list[list[int]] | None = None,
-    electrode_supports: list[np.ndarray] | None = None,
-    enforce_connectivity: bool = True,
-    repair_disconnected: bool = False,
-    benchmark_fn: Any = None,
-    benchmark_name: str | None = None,
-    benchmark_weights: dict[str, float] | None = None,
-    mesh_centroids: np.ndarray | None = None,
+    fwd,
+    state,
+    variable_mask,
+    low_cond,
+    high_cond,
+    adjacency=None,
+    electrode_supports=None,
+    enforce_connectivity=True,
+    repair_disconnected=False,
+    benchmark_fn=None,
+    benchmark_name=None,
+    benchmark_weights=None,
+    mesh_centroids=None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
+
     state_full = get_state_for_connectivity(state, variable_mask)
 
+    # ── REPAIR: ensure each electrode support has ≥1 high element ──────────
+    if repair_disconnected and adjacency is not None and electrode_supports is not None:
+        for support in electrode_supports:
+            support_idx = np.asarray(support, dtype=int)
+            if support_idx.size == 0:
+                continue
+            if not np.any(state_full[support_idx]):
+                # Pick the support element with most high neighbours to minimise
+                # connectivity disruption
+                best = max(
+                    support_idx,
+                    key=lambda i: sum(1 for n in adjacency[i] if state_full[n])
+                )
+                state_full[best] = True
+
+    # ── CONNECTIVITY CHECK (only for element model — skip for field models) ─
+    # For branching/fungal the field is continuous; hard rejection is wrong.
+    # Instead, compute the score and let the cost function handle topology.
     if enforce_connectivity and not repair_disconnected and adjacency is not None:
         if not electrodes_connected_by_high_region(state_full, adjacency, electrode_supports):
             perm_bad = make_permittivity(state_full, variable_mask, low_cond, high_cond)
-            return perm_bad, np.zeros_like(perm_bad, dtype=float), np.inf
+            # Return a LARGE but finite penalty so gradient info is preserved
+            # and the display still shows something useful
+            penalty = 10
+            sensitivity_bad = np.zeros(perm_bad.size, dtype=float)
+            return perm_bad, sensitivity_bad, penalty
 
     perm = make_permittivity(state_full, variable_mask, low_cond, high_cond)
     jacobian, _ = fwd.compute_jac(perm=perm)
@@ -893,7 +1087,6 @@ def evaluate_state(
         )
     )
     return perm, sensitivity, score
-
 
 def optimize_parameterized_field_de(
     fwd: EITForward,
@@ -1174,6 +1367,11 @@ def load_saved_result(npz_path: str) -> dict[str, Any]:
             "node": np.asarray(data["node"], dtype=float) if "node" in data.files else None,
             "element": np.asarray(data["element"], dtype=int) if "element" in data.files else None,
             "el_pos": np.asarray(data["el_pos"], dtype=int).ravel() if "el_pos" in data.files else None,
+            "p1": np.asarray(data["p1"], dtype=float).ravel() if "p1" in data.files else None,
+            "p2": np.asarray(data["p2"], dtype=float).ravel() if "p2" in data.files else None,
+            "best_theta": np.asarray(data["best_theta"], dtype=float).ravel() if "best_theta" in data.files else None,
+            "best_history": np.asarray(data["best_history"], dtype=float).ravel() if "best_history" in data.files else None,
+            "current_history": np.asarray(data["current_history"], dtype=float).ravel() if "current_history" in data.files else None,
         }
 
 
@@ -1354,6 +1552,8 @@ class CombinedOptimizerUI:
         self.mesh_colorbar = None
         self.sensitivity_colorbar = None
         self.biomimetic_thread: threading.Thread | None = None
+        self.saved_benchmark_viewer_window: tk.Toplevel | None = None
+        self.analytical_benchmark_viewer_window: tk.Toplevel | None = None
 
         self._build_variables()
         self._build_ui()
@@ -1407,6 +1607,9 @@ class CombinedOptimizerUI:
         self.fungal_sigma_max_var = tk.StringVar(value="")
         self.fungal_normalise_var = tk.BooleanVar(value=False)
 
+        self.patch_growth_steps_var = tk.StringVar(value="200")
+        self.patch_frontier_batch_size_var = tk.StringVar(value="3")
+
         self.touch_radius_var = tk.StringVar(value="0.30")
         self.touch_samples_var = tk.StringVar(value="200")
         self.touch_temperature_var = tk.StringVar(value="1.0")
@@ -1430,6 +1633,11 @@ class CombinedOptimizerUI:
         self.benchmark_npz_var = tk.StringVar(value="")
         self.benchmark_score_json_var = tk.StringVar(value="")
         self.benchmark_result_var = tk.StringVar(value="No benchmark run yet.")
+        
+        # Analytical reconstruction benchmark variables
+        self.analytical_mesh_npz_var = tk.StringVar(value="")
+        self.analytical_mesh_loaded = None
+        self.analytical_results = None
 
     def _build_ui(self) -> None:
         outer = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
@@ -1532,7 +1740,7 @@ class CombinedOptimizerUI:
             title="Model",
             selector_label="Model",
             selector_var=self.model_option_var,
-            selector_values=("Element Model", "Fungal Growth", "Branching Model"),
+            selector_values=("Element Model", "Fungal Growth", "Branching Model", "Patch Expansion"),
             selector_hint="Choose element-wise conductivity or a growth model seeded from the mesh boundary.",
             builder=self._build_model_options,
         )
@@ -1631,6 +1839,20 @@ class CombinedOptimizerUI:
             self._row_entry(parent, 3, "Seed", self.seed_var)
             return
 
+        if selected == "Patch Expansion":
+            ttk.Label(parent, text=(
+                "Starts from electrode-touching elements and grows one frontier "
+                "batch per step per patch frontier. θ[t] picks a frontier center; "
+                "the model activates the top-k nearest frontier elements at that step. "
+                "Always electrode-connected by construction."
+            ), wraplength=360).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0,8))
+            self._row_entry(parent, 1, "Low cond",    self.low_cond_var)
+            self._row_entry(parent, 2, "High cond",   self.high_cond_var)
+            self._row_entry(parent, 3, "Seed",        self.seed_var)
+            self._row_entry(parent, 4, "Growth steps",self.patch_growth_steps_var)
+            self._row_entry(parent, 5, "Frontier batch size", self.patch_frontier_batch_size_var)
+            return
+
         if selected not in {"Fungal Growth", "Branching Model"}:
             ttk.Label(parent, text=f"Unsupported model: {selected}").pack(anchor="w")
             return
@@ -1692,24 +1914,55 @@ class CombinedOptimizerUI:
         ttk.Label(parent, textvariable=self.save_info_var, wraplength=380).pack(anchor="w")
 
     def _build_benchmark_tab(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Post-save Benchmarking", padding=8)
-        frame.pack(fill=tk.X, pady=(0, 8))
+        # ────── Mesh Loading Section ──────
+        mesh_frame = ttk.LabelFrame(parent, text="Load Mesh for Analytical Testing", padding=8)
+        mesh_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(
-            frame,
-            text="Load a saved NPZ and score the exported conductivity state with the selected benchmark.",
+            mesh_frame,
+            text="Load an NPZ mesh file to run analytical reconstruction benchmarks including sensitivity, touch localization, and shape recovery.",
             wraplength=360,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-        self._row_entry(frame, 1, "Saved NPZ", self.benchmark_npz_var)
-        self._row_entry(frame, 2, "Score JSON", self.benchmark_score_json_var)
+        self._row_entry(mesh_frame, 1, "Mesh NPZ", self.analytical_mesh_npz_var)
+        ttk.Button(mesh_frame, text="Browse Mesh", command=self.browse_analytical_mesh).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(mesh_frame, text="Load Mesh", command=self.load_analytical_mesh).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
-        ttk.Button(frame, text="Browse NPZ", command=self.browse_benchmark_npz).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(frame, text="Score Saved Result", command=self.run_saved_benchmark).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Button(frame, text="Use Last Saved Run", command=self.load_last_saved_run_for_benchmark).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Button(frame, text="Use Current Saved Run", command=self.use_current_saved_run_for_benchmark).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.mesh_status_var = tk.StringVar(value="No mesh loaded.")
+        ttk.Label(mesh_frame, textvariable=self.mesh_status_var, wraplength=360).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
-        ttk.Label(parent, textvariable=self.benchmark_result_var, wraplength=380).pack(anchor="w")
+        # ────── Analytical Tests Section ──────
+        test_frame = ttk.LabelFrame(parent, text="Analytical Reconstruction Tests", padding=8)
+        test_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            test_frame,
+            text="Run comprehensive analytical tests: sensitivity heatmap, touch point localization at varying distances, and geometric shape recovery (cross, star, C-shape).",
+            wraplength=360,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Button(test_frame, text="Run All Analytical Tests", command=self.run_all_analytical_tests).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(test_frame, text="Generate Test Report", command=self.generate_test_report).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        self.analytical_status_var = tk.StringVar(value="Load a mesh and run tests.")
+        ttk.Label(test_frame, textvariable=self.analytical_status_var, wraplength=360).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        # ────── Legacy Benchmarking (Optional) ──────
+        legacy_frame = ttk.LabelFrame(parent, text="Legacy: Quick Benchmark", padding=8)
+        legacy_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            legacy_frame,
+            text="Load a saved optimization NPZ and score with a quick benchmark.",
+            wraplength=360,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        self._row_entry(legacy_frame, 1, "Saved NPZ", self.benchmark_npz_var)
+        ttk.Button(legacy_frame, text="Browse NPZ", command=self.browse_benchmark_npz).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Button(legacy_frame, text="Score Saved Result", command=self.run_saved_benchmark).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        self.legacy_result_var = tk.StringVar(value="No legacy benchmark run yet.")
+        ttk.Label(legacy_frame, textvariable=self.legacy_result_var, wraplength=360).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
     def _build_biomimetic_tab(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Biomimetic Analysis", padding=8)
@@ -1962,6 +2215,8 @@ class CombinedOptimizerUI:
             return "fungal"
         if model == "branching model":
             return "branching"
+        if model == "patch expansion":
+            return "patch_expansion"
         raise ValueError(f"Unsupported model selected: {self.model_option_var.get()}")
 
     def _selected_benchmark_name(self) -> str:
@@ -2009,18 +2264,33 @@ class CombinedOptimizerUI:
                     "branching_seed_all_electrodes": bool(self.branching_seed_all_electrodes_var.get()),
                 }
             )
+        if model == "patch_expansion":
+            cfg["patch_n_growth_steps"] = parse_int(
+                self.patch_growth_steps_var, "patch growth steps"
+            )
+            cfg["patch_frontier_batch_size"] = _validate_positive_int(
+                "patch frontier batch size",
+                parse_int(self.patch_frontier_batch_size_var, "patch frontier batch size"),
+            )
         return cfg
 
-    def _build_field_geometry(self, field_shape_cfg: dict[str, Any]) -> dict[str, Any]:
+    def _build_field_geometry(self, field_shape_cfg: dict[str, Any], adjacency: list[list[int]]) -> dict[str, Any]:
         if self.mesh_obj is None or self.variable_mask is None:
             raise ValueError("Generate a mesh before building field geometry.")
         p1, p2 = self._mesh_bounds()
+        electrode_supports = build_electrode_support_elements(
+            self.mesh_obj,
+            self.variable_mask,
+            k_nearest=4
+        )
         return build_field_geometry(
             mesh_obj=self.mesh_obj,
             variable_mask=self.variable_mask,
             p1=p1,
             p2=p2,
             field_shape_cfg=field_shape_cfg,
+            adjacency=adjacency,         
+            electrode_supports=electrode_supports, 
         )
 
     def _build_context(self) -> OptimizationContext:
@@ -2032,17 +2302,18 @@ class CombinedOptimizerUI:
         strategy = self.strategy_option_var.get()
         if metric not in {"Uniformity", "Expected Sensitivity", "Minimax Sensitivity", "Softmin Sensitivity", "SNR Sensitivity", "Distinguishability", "Combined"}:
             raise ValueError(f"Unsupported metric selected: {metric}")
-        if model not in {"Element Model", "Fungal Growth", "Branching Model"}:
+        if model not in {"Element Model", "Fungal Growth", "Branching Model", "Patch Expansion"}:
             raise ValueError(f"Unsupported model selected: {model}")
         if strategy != "DE":
             raise ValueError(f"Unsupported strategy selected: {strategy}")
 
         p1, p2 = self._mesh_bounds()
         field_shape_cfg = self._build_field_shape_cfg()
-        field_geometry = self._build_field_geometry(field_shape_cfg)
+        adjacency = build_element_adjacency(self.mesh_obj)
+        field_geometry = self._build_field_geometry(field_shape_cfg, adjacency=adjacency)
         n_params = int(parameter_vector_size_from_cfg(field_shape_cfg, field_geometry))
 
-        adjacency = build_element_adjacency(self.mesh_obj)
+        
         electrode_supports = build_electrode_support_elements(
             self.mesh_obj,
             self.variable_mask,
@@ -2092,7 +2363,7 @@ class CombinedOptimizerUI:
             n_measurements = int(np.asarray(self.protocol_obj.meas_mat).shape[0])
             n_variable = int(np.count_nonzero(self.variable_mask))
             field_shape_cfg = self._build_field_shape_cfg()
-            field_geometry = self._build_field_geometry(field_shape_cfg)
+            field_geometry = self._build_field_geometry(field_shape_cfg, adjacency=build_element_adjacency(self.mesh_obj))
             n_params = int(parameter_vector_size_from_cfg(field_shape_cfg, field_geometry))
             self.mesh_info_var.set(
                 f"Mesh ready: {n_elements} elements, {len(self.mesh_obj.el_pos)} electrodes, {n_measurements} measurements, {n_variable} variable elements."
@@ -2145,7 +2416,7 @@ class CombinedOptimizerUI:
 
         def worker() -> None:
             try:
-                field_geometry = self._build_field_geometry(context.field_shape_cfg)
+                field_geometry = self._build_field_geometry(context.field_shape_cfg, adjacency=context.adjacency)
                 n_params = int(parameter_vector_size_from_cfg(context.field_shape_cfg, field_geometry))
                 self.optimization_queue.put({"type": "meta", "payload": {"n_params": n_params}})
 
@@ -2249,8 +2520,14 @@ class CombinedOptimizerUI:
         current_score = float(payload.get("current_score", np.inf))
         best_perm = payload.get("best_perm")
         best_state = payload.get("best_state")
-        best_sensitivity = payload.get("best_sensitivity")
         best_theta = payload.get("best_theta")
+        best_sensitivity = payload.get("best_sensitivity")
+
+        # Don't update display with zero-sensitivity from rejected candidates
+        if best_sensitivity is not None:
+            s = np.asarray(best_sensitivity, dtype=float)
+            if np.all(s == 0):
+                best_sensitivity = None  # fall back to reference
 
         self.live_best_history.append(best_score)
         self.live_current_history.append(current_score)
@@ -2561,7 +2838,7 @@ class CombinedOptimizerUI:
             messagebox.showinfo("No saved run", "Save an optimization result first.")
             return
         self.benchmark_npz_var.set(self.last_saved_npz_path)
-        self.benchmark_result_var.set(f"Loaded last saved run: {self.last_saved_npz_path}")
+        self.legacy_result_var.set(f"Loaded last saved run: {self.last_saved_npz_path}")
 
     def use_current_saved_run_for_benchmark(self) -> None:
         if self.last_saved_npz_path:
@@ -2586,14 +2863,23 @@ class CombinedOptimizerUI:
                 benchmark_weights=benchmark_weights,
             )
 
-            self.benchmark_result_var.set(
+            try:
+                self._show_saved_benchmark_viewer(
+                    npz_path=npz_path,
+                    benchmark_name=benchmark_name,
+                    benchmark_weights=benchmark_weights,
+                    summary_result=result,
+                )
+            except Exception as viewer_exc:
+                self.legacy_result_var.set(
+                    f"Score={result['score']:.6e} | connected={result['high_elements_connected']} | isolated={result['isolated_high_elements']} | viewer unavailable"
+                )
+                messagebox.showwarning("Benchmark viewer unavailable", str(viewer_exc))
+
+            self.legacy_result_var.set(
                 f"Score={result['score']:.6e} | connected={result['high_elements_connected']} | isolated={result['isolated_high_elements']}"
             )
 
-            score_json = str(self.benchmark_score_json_var.get()).strip()
-            if score_json:
-                with open(score_json, "w", encoding="utf-8") as f:
-                    json.dump(result, f, indent=2)
             messagebox.showinfo(
                 "Benchmark complete",
                 "Saved benchmark summary:\n"
@@ -2605,6 +2891,371 @@ class CombinedOptimizerUI:
             )
         except Exception as exc:
             messagebox.showerror("Benchmark failed", str(exc))
+
+    def _show_saved_benchmark_viewer(
+        self,
+        npz_path: str,
+        benchmark_name: str,
+        benchmark_weights: dict[str, float],
+        summary_result: dict[str, Any],
+    ) -> None:
+        del benchmark_name, benchmark_weights
+
+        payload = load_saved_result(npz_path)
+        node = payload.get("node")
+        element = payload.get("element")
+        el_pos = payload.get("el_pos")
+        if node is None or element is None or el_pos is None:
+            raise ValueError("Saved benchmark NPZ must include node, element, and el_pos arrays for visualization.")
+
+        p1 = payload.get("p1")
+        p2 = payload.get("p2")
+        if p1 is None or p2 is None:
+            node_xy = np.asarray(node, dtype=float)[:, :2]
+            x_min = float(np.min(node_xy[:, 0]))
+            x_max = float(np.max(node_xy[:, 0]))
+            y_min = float(np.min(node_xy[:, 1]))
+            y_max = float(np.max(node_xy[:, 1]))
+            p1 = np.asarray([x_min, y_min], dtype=float)
+            p2 = np.asarray([x_max, y_max], dtype=float)
+
+        mesh_obj = PyEITMesh(
+            node=np.asarray(node, dtype=float),
+            element=np.asarray(element, dtype=int),
+            el_pos=np.asarray(el_pos, dtype=int),
+            perm=np.asarray(payload["best_perm"], dtype=float),
+        )
+
+        plot_results(
+            mesh_obj=mesh_obj,
+            p1=[float(v) for v in np.asarray(p1, dtype=float).ravel()],
+            p2=[float(v) for v in np.asarray(p2, dtype=float).ravel()],
+            best_perm=payload["best_perm"],
+            best_sensitivity=payload["best_sensitivity"],
+            best_hist=np.asarray(payload["best_history"] if payload.get("best_history") is not None else [], dtype=float),
+            curr_hist=np.asarray(payload["current_history"] if payload.get("current_history") is not None else [], dtype=float),
+            best_score=float(summary_result["score"]),
+            best_theta=payload.get("best_theta"),
+            field_shape_cfg=None,
+            comparison_rows=[],
+        )
+
+    # ─────────────────── ANALYTICAL RECONSTRUCTION BENCHMARKS ───────────────────
+
+    def browse_analytical_mesh(self) -> None:
+        """Browse for an NPZ mesh file."""
+        path = filedialog.askopenfilename(
+            title="Select mesh NPZ file",
+            filetypes=[("NPZ files", "*.npz"), ("All files", "*.*")],
+        )
+        if path:
+            self.analytical_mesh_npz_var.set(path)
+
+    def load_analytical_mesh(self) -> None:
+        """Load the mesh from the selected NPZ file."""
+        npz_path = str(self.analytical_mesh_npz_var.get()).strip()
+        if not npz_path:
+            messagebox.showwarning("Missing NPZ", "Select a mesh NPZ file first.")
+            return
+
+        try:
+            with np.load(npz_path, allow_pickle=False) as data:
+                required = {"node", "element", "el_pos"}
+                missing = required - set(data.files)
+                if missing:
+                    raise ValueError(f"Missing required arrays: {', '.join(missing)}")
+
+                self.analytical_mesh_loaded = {
+                    "node": np.asarray(data["node"], dtype=float),
+                    "element": np.asarray(data["element"], dtype=int),
+                    "el_pos": np.asarray(data["el_pos"], dtype=int),
+                    "p1": np.asarray(data["p1"], dtype=float) if "p1" in data.files else None,
+                    "p2": np.asarray(data["p2"], dtype=float) if "p2" in data.files else None,
+                    "path": npz_path,
+                }
+
+                n_elements = self.analytical_mesh_loaded["element"].shape[0]
+                n_nodes = self.analytical_mesh_loaded["node"].shape[0]
+                n_electrodes = self.analytical_mesh_loaded["el_pos"].size
+
+                self.mesh_status_var.set(
+                    f"Loaded: {n_elements} elements, {n_nodes} nodes, {n_electrodes} electrodes"
+                )
+                self.analytical_status_var.set("Mesh loaded. Ready to run tests.")
+                messagebox.showinfo(
+                    "Mesh loaded",
+                    f"Elements: {n_elements}\nNodes: {n_nodes}\nElectrodes: {n_electrodes}",
+                )
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+            self.analytical_mesh_loaded = None
+            self.mesh_status_var.set("Failed to load mesh.")
+
+    def run_all_analytical_tests(self) -> None:
+        """Run all analytical reconstruction tests."""
+        if self.analytical_mesh_loaded is None:
+            messagebox.showwarning("No mesh", "Load a mesh first.")
+            return
+
+        try:
+            from analytical_reconstruction import run_all_reconstructions
+
+            self.analytical_status_var.set("Running tests... (this may take a moment)")
+            self.root.update()
+
+            # Build mesh objects
+            mesh_obj = PyEITMesh(
+                node=self.analytical_mesh_loaded["node"],
+                element=self.analytical_mesh_loaded["element"],
+                el_pos=self.analytical_mesh_loaded["el_pos"],
+                perm=np.ones(self.analytical_mesh_loaded["element"].shape[0]),
+            )
+
+            n_el = int(self.analytical_mesh_loaded["el_pos"].size)
+            protocol_obj = protocol.create(
+                n_el=n_el,
+                dist_exc=max(1, n_el // 2),
+                step_meas=1,
+                parser_meas="rotate_meas",
+            )
+
+            # Compute Jacobian
+            fwd = EITForward(mesh_obj, protocol_obj)
+            perm_uniform = np.ones(mesh_obj.n_elems, dtype=float)
+            jacobian, _ = fwd.compute_jac(perm=perm_uniform)
+            # keep jacobian for visualization (sensitivity overlay)
+            self.analytical_jacobian = np.asarray(jacobian, dtype=float)
+
+            # Compute mesh centroids and bounding box
+            pts = np.asarray(self.analytical_mesh_loaded["node"], dtype=float)
+            tri = np.asarray(self.analytical_mesh_loaded["element"], dtype=int)
+            centroids = np.mean(pts[tri], axis=1)[:, :2]
+
+            if self.analytical_mesh_loaded["p1"] is not None and self.analytical_mesh_loaded["p2"] is not None:
+                p1 = self.analytical_mesh_loaded["p1"]
+                p2 = self.analytical_mesh_loaded["p2"]
+                bbox = (p1[0], p2[0], p1[1], p2[1])
+            else:
+                x_min, x_max = np.min(pts[:, 0]), np.max(pts[:, 0])
+                y_min, y_max = np.min(pts[:, 1]), np.max(pts[:, 1])
+                bbox = (x_min, x_max, y_min, y_max)
+
+            # Run reconstruction tests
+            self.analytical_results = run_all_reconstructions(
+                jacobian=jacobian,
+                mesh_centroids=centroids,
+                bbox=bbox,
+                element_conductivity=perm_uniform,
+            )
+
+            try:
+                self._show_analytical_benchmark_viewer()
+            except Exception as viewer_exc:
+                self.analytical_status_var.set(f"Tests complete, but viewer could not be opened: {viewer_exc}")
+
+            self.analytical_status_var.set("Tests complete! Generate report to see detailed results.")
+            messagebox.showinfo("Tests complete", "Analytical reconstruction tests finished successfully.")
+
+        except Exception as exc:
+            messagebox.showerror("Test failed", str(exc))
+            self.analytical_status_var.set("Tests failed. See error dialog.")
+
+    def _show_analytical_benchmark_viewer(self) -> None:
+        if self.analytical_mesh_loaded is None or self.analytical_results is None:
+            raise ValueError("Run the analytical tests before opening the benchmark viewer.")
+
+        from analytical_reconstruction import shape_c, shape_cross, shape_star, touch_point_at_distance_from_edge
+
+        node = np.asarray(self.analytical_mesh_loaded["node"], dtype=float)
+        element = np.asarray(self.analytical_mesh_loaded["element"], dtype=int)
+        el_pos = np.asarray(self.analytical_mesh_loaded["el_pos"], dtype=int).reshape(-1)
+        centroids = np.mean(node[element], axis=1)[:, :2]
+
+        if self.analytical_mesh_loaded["p1"] is not None and self.analytical_mesh_loaded["p2"] is not None:
+            p1 = np.asarray(self.analytical_mesh_loaded["p1"], dtype=float).ravel()
+            p2 = np.asarray(self.analytical_mesh_loaded["p2"], dtype=float).ravel()
+            bbox = (float(p1[0]), float(p2[0]), float(p1[1]), float(p2[1]))
+        else:
+            x_min = float(np.min(node[:, 0]))
+            x_max = float(np.max(node[:, 0]))
+            y_min = float(np.min(node[:, 1]))
+            y_max = float(np.max(node[:, 1]))
+            bbox = (x_min, x_max, y_min, y_max)
+
+        cases: list[tuple[str, np.ndarray, dict[str, float]]] = []
+        for distance_key, distance_frac in (("distance_0.2", 0.2), ("distance_0.5", 0.5), ("distance_0.8", 0.8)):
+            state = touch_point_at_distance_from_edge(centroids, bbox, distance_frac)
+            cases.append((f"Touch {distance_frac:.1f}", state, dict(self.analytical_results["touch_points"][distance_key])))
+
+        for shape_name, state in (("Cross", shape_cross(centroids, bbox)), ("Star", shape_star(centroids, bbox)), ("C-shape", shape_c(centroids, bbox))):
+            metrics_key = shape_name.lower().replace("-", "_")
+            cases.append((shape_name, state, dict(self.analytical_results["shapes"][metrics_key])))
+
+        if self.analytical_benchmark_viewer_window is not None:
+            try:
+                self.analytical_benchmark_viewer_window.destroy()
+            except Exception:
+                pass
+
+        window = tk.Toplevel(self.root)
+        window.title("Analytical Benchmark Viewer")
+        window.geometry("1400x900")
+        self.analytical_benchmark_viewer_window = window
+
+        figure = Figure(figsize=(14, 8.5), dpi=100)
+        axes = figure.subplots(2, 3)
+        axes_flat = axes.ravel()
+
+        # compute sensitivity display (log-scale) once for overlay
+        sens_display = None
+        try:
+            sens = element_sensitivity_from_jacobian(self.analytical_jacobian)
+            sens_display = sensitivity_for_display(sens)
+        except Exception:
+            sens_display = None
+
+        im_sens = None
+        for ax, (title, state, metrics) in zip(axes_flat, cases):
+            im = ax.tripcolor(node[:, 0], node[:, 1], element, np.asarray(state, dtype=float), shading="flat", cmap="Reds", vmin=0.0, vmax=1.0)
+            if el_pos.size:
+                ax.scatter(node[el_pos, 0], node[el_pos, 1], c="#111111", s=14, zorder=3, label="Electrodes")
+            ax.set_aspect("equal")
+            ax.set_title(title)
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.text(
+                0.02,
+                0.02,
+                " | ".join(
+                    [
+                        f"corr={metrics.get('correlation', 0.0):.3f}",
+                        f"l2={metrics.get('l2_error', 0.0):.3f}",
+                        f"snr={metrics.get('snr_db', 0.0):.2f}",
+                        f"loc={metrics.get('localization', 0.0):.3f}",
+                    ]
+                ),
+                transform=ax.transAxes,
+                fontsize=8,
+                va="bottom",
+                bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+            )
+            ax.grid(alpha=0.12)
+            # overlay sensitivity heatmap if available
+            if sens_display is not None:
+                try:
+                    im_sens = ax.tripcolor(node[:, 0], node[:, 1], element, sens_display, shading="flat", cmap="viridis", alpha=0.5)
+                except Exception:
+                    im_sens = None
+            figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        figure.suptitle("Analytical benchmark cases and reconstruction quality", y=0.98)
+        # add a single colorbar for sensitivity overlay if we created one
+        if im_sens is not None:
+            try:
+                figure.colorbar(im_sens, ax=axes_flat.tolist(), fraction=0.02, pad=0.02, label="sensitivity (log10)")
+            except Exception:
+                pass
+
+        figure.tight_layout(rect=(0, 0, 1, 0.96))
+
+        canvas = FigureCanvasTkAgg(figure, master=window)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        canvas.draw_idle()
+
+        self.analytical_benchmark_canvas = canvas
+        self.analytical_benchmark_figure = figure
+
+    def generate_test_report(self) -> None:
+        """Generate a detailed report of the analytical tests."""
+        if self.analytical_results is None:
+            messagebox.showwarning("No results", "Run tests first.")
+            return
+
+        try:
+            report = self._format_analytical_report()
+            
+            # Save report to file
+            save_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            )
+            if save_path:
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(report)
+                messagebox.showinfo("Report saved", f"Saved to:\n{save_path}")
+
+            # Also show in a text window
+            self._show_report_window(report)
+
+        except Exception as exc:
+            messagebox.showerror("Report failed", str(exc))
+
+    def _format_analytical_report(self) -> str:
+        """Format the analytical test results as a readable report."""
+        if self.analytical_results is None:
+            return "No test results available."
+
+        report = "=" * 80 + "\n"
+        report += "ANALYTICAL RECONSTRUCTION BENCHMARK REPORT\n"
+        report += "=" * 80 + "\n\n"
+
+        if self.analytical_mesh_loaded:
+            report += f"Mesh: {self.analytical_mesh_loaded.get('path', 'Unknown')}\n"
+            report += f"Elements: {self.analytical_mesh_loaded['element'].shape[0]}\n"
+            report += f"Nodes: {self.analytical_mesh_loaded['node'].shape[0]}\n"
+            report += f"Electrodes: {self.analytical_mesh_loaded['el_pos'].size}\n\n"
+
+        # Touch point tests
+        report += "-" * 80 + "\n"
+        report += "TOUCH POINT LOCALIZATION (at varying distances from edge)\n"
+        report += "-" * 80 + "\n\n"
+
+        if "touch_points" in self.analytical_results:
+            for test_name, metrics in self.analytical_results["touch_points"].items():
+                report += f"{test_name.upper()}\n"
+                report += f"  Correlation:  {metrics.get('correlation', 0.0):.4f}\n"
+                report += f"  L2 Error:     {metrics.get('l2_error', 0.0):.4f}\n"
+                report += f"  SNR (dB):     {metrics.get('snr_db', 0.0):.2f}\n"
+                report += f"  Localization: {metrics.get('localization', 0.0):.4f}\n\n"
+
+        # Shape tests
+        report += "-" * 80 + "\n"
+        report += "GEOMETRIC SHAPE RECOVERY\n"
+        report += "-" * 80 + "\n\n"
+
+        if "shapes" in self.analytical_results:
+            for shape_name, metrics in self.analytical_results["shapes"].items():
+                report += f"{shape_name.upper()}\n"
+                report += f"  Correlation:  {metrics.get('correlation', 0.0):.4f}\n"
+                report += f"  L2 Error:     {metrics.get('l2_error', 0.0):.4f}\n"
+                report += f"  SNR (dB):     {metrics.get('snr_db', 0.0):.2f}\n"
+                report += f"  Localization: {metrics.get('localization', 0.0):.4f}\n\n"
+
+        report += "=" * 80 + "\n"
+        report += "INTERPRETATION:\n"
+        report += "  Correlation:   How well sensitivity matches synthetic pattern (-1 to 1, higher is better)\n"
+        report += "  L2 Error:      Root mean squared difference (lower is better)\n"
+        report += "  SNR (dB):      Signal-to-noise ratio in target region (higher is better)\n"
+        report += "  Localization:  Fraction of sensitivity within target (0 to 1, higher is better)\n"
+        report += "=" * 80 + "\n"
+
+        return report
+
+    def _show_report_window(self, report: str) -> None:
+        """Display the report in a new text window."""
+        report_window = tk.Toplevel(self.root)
+        report_window.title("Analytical Benchmark Report")
+        report_window.geometry("800x600")
+
+        text_widget = tk.Text(report_window, wrap=tk.WORD, font=("Courier", 9))
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        scrollbar = ttk.Scrollbar(report_window, orient=tk.VERTICAL, command=text_widget.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_widget.config(yscrollcommand=scrollbar.set)
+
+        text_widget.insert(tk.END, report)
+        text_widget.config(state=tk.DISABLED)
 
     def _connectivity_summary(self, state: Any) -> dict[str, Any]:
         if self.context is None or state is None:

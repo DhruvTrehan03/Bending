@@ -399,7 +399,7 @@ def parameter_vector_size(rbf_rows, rbf_cols):
     return 1 + int(rbf_rows) * int(rbf_cols)
 
 
-def parameter_vector_size_from_cfg(field_shape_cfg, field_geometry=None):
+def parameter_vector_size_from_cfg(field_shape_cfg):
     """Return parameter count for the selected field-shape model."""
     model = str(field_shape_cfg.get("model", "rbf")).strip().lower()
     if model == "rbf":
@@ -412,12 +412,6 @@ def parameter_vector_size_from_cfg(field_shape_cfg, field_geometry=None):
         # Free-shift: threshold, c_real, c_imag, zoom_log2, shift_x, shift_y, angle
         center_locked = bool(field_shape_cfg.get("fractal_center_origin", True))
         return 5 if center_locked else 7
-    if model == "element":
-        # Element model: size determined from field_geometry
-        if field_geometry is not None and "n_variable_elements" in field_geometry:
-            return int(field_geometry["n_variable_elements"])
-        # Fallback: return 0 if geometry not available yet (will be set later)
-        return 0
     raise ValueError(f"Unsupported field-shape model: {model}")
 
 
@@ -488,18 +482,6 @@ def _branching_segment_distance(xn, yn, x0, y0, x1, y1):
     return np.sqrt((xn - px) ** 2 + (yn - py) ** 2)
 
 
-def _deterministic_signed_noise(*values):
-    """Return deterministic pseudo-random value in [-1, 1] from numeric inputs."""
-    seed = 0.0
-    coeff = 0.7548776662466927
-    for val in values:
-        seed = seed * 1.618033988749895 + coeff * float(val)
-        coeff = coeff * 1.4142135623730951 + 0.2718281828459045
-    raw = np.sin(seed * 12.9898 + 78.233) * 43758.5453123
-    frac = raw - np.floor(raw)
-    return float(2.0 * frac - 1.0)
-
-
 def _branching_fractal_params_from_cfg(field_shape_cfg, theta):
     """Extract branching-fractal parameters from config and theta."""
     theta = np.asarray(theta, dtype=float).ravel()
@@ -524,20 +506,17 @@ def _branching_fractal_params_from_cfg(field_shape_cfg, theta):
     length_decay = float(field_shape_cfg.get("branching_length_decay", 0.68))
     width_frac = float(field_shape_cfg.get("branching_width_frac", 0.12))
     width_decay = float(field_shape_cfg.get("branching_width_decay", 0.80))
-    mirror_vertical = bool(field_shape_cfg.get("branching_mirror_vertical", False))
-    aim_electrodes = bool(field_shape_cfg.get("branching_aim_electrodes", False))
-    target_blend = float(field_shape_cfg.get("branching_target_blend", 0.0))
+    mirror_vertical = bool(field_shape_cfg.get("branching_mirror_vertical", True))
+    aim_electrodes = bool(field_shape_cfg.get("branching_aim_electrodes", True))
+    target_blend = float(field_shape_cfg.get("branching_target_blend", 0.55))
     root_x = float(field_shape_cfg.get("branching_root_x_frac", 0.18))
     root_y = float(field_shape_cfg.get("branching_root_y_frac", 0.0))
     force_touch_all = bool(field_shape_cfg.get("branching_force_touch_all_electrodes", True))
-    seed_all_electrodes = bool(field_shape_cfg.get("branching_seed_all_electrodes", True))
+    seed_all_electrodes = bool(field_shape_cfg.get("branching_seed_all_electrodes", False))
     force_meet_center = bool(field_shape_cfg.get("branching_force_meet_center", True))
     meet_x = float(field_shape_cfg.get("branching_meet_x_frac", 0.0))
     meet_y = float(field_shape_cfg.get("branching_meet_y_frac", 0.0))
     meet_blend = float(field_shape_cfg.get("branching_meet_blend", 1.0))
-    random_angle_frac = float(field_shape_cfg.get("branching_random_angle_frac", 0.0))
-    random_center_boost = float(field_shape_cfg.get("branching_random_center_boost", 0.0))
-    random_center_power = float(field_shape_cfg.get("branching_random_center_power", 1.0))
     electrode_points_all = field_shape_cfg.get("branching_electrode_points_norm")
     electrode_points = field_shape_cfg.get("branching_electrode_points_norm_right")
     if electrode_points is None:
@@ -570,11 +549,6 @@ def _branching_fractal_params_from_cfg(field_shape_cfg, theta):
         "meet_x": meet_x,
         "meet_y": meet_y,
         "meet_blend": meet_blend,
-        "random_angle": float(np.clip(np.pi * random_angle_frac, 0.0, 0.45 * np.pi)),
-        "random_center_boost": float(max(0.0, random_center_boost)),
-        "random_center_power": float(np.clip(random_center_power, 0.25, 5.0)),
-        "noise_seed_real": c_real,
-        "noise_seed_imag": c_imag,
         "electrode_points_all": electrode_points_all,
         "electrode_points": electrode_points,
         "branch_angle_left": float(branch_angle_left),
@@ -601,28 +575,6 @@ def _evaluate_branching_fractal_field_from_normalized_coords(
 
     segments = []
     center_target = np.array([params["meet_x"], params["meet_y"]], dtype=float)
-    root_radius = np.hypot(params["root_x"] - center_target[0], params["root_y"] - center_target[1])
-    root_radius = max(root_radius, 1e-6)
-
-    def random_angle_jitter(x_pos, y_pos, depth, branch_tag):
-        """Deterministic angular jitter that grows near the center target."""
-        if params["random_angle"] <= 0.0:
-            return 0.0
-
-        dist_to_center = np.hypot(x_pos - center_target[0], y_pos - center_target[1])
-        center_proximity = 1.0 - np.clip(dist_to_center / root_radius, 0.0, 1.0)
-        center_gain = 1.0 + params["random_center_boost"] * (
-            center_proximity ** params["random_center_power"]
-        )
-        signed_noise = _deterministic_signed_noise(
-            x_pos,
-            y_pos,
-            depth,
-            branch_tag,
-            params["noise_seed_real"],
-            params["noise_seed_imag"],
-        )
-        return params["random_angle"] * center_gain * signed_noise
 
     def guidance_angle(x_pos, y_pos, fallback_angle):
         """Blend the current branch heading toward the nearest electrode."""
@@ -640,7 +592,7 @@ def _evaluate_branching_fractal_field_from_normalized_coords(
 
         return _blend_angles(fallback_angle, target_angle, params["target_blend"])
 
-    def grow(x0, y0, length, angle, depth, branch_tag):
+    def grow(x0, y0, length, angle, depth):
         if depth >= params["max_depth"] or length <= 1e-3:
             return
 
@@ -649,18 +601,16 @@ def _evaluate_branching_fractal_field_from_normalized_coords(
         segments.append((x0, y0, x1, y1, depth))
 
         next_length = length * params["length_decay"]
-        left_base = guidance_angle(x1, y1, angle + params["branch_angle_left"])
-        right_base = guidance_angle(x1, y1, angle - params["branch_angle_right"])
-        left_angle = left_base + random_angle_jitter(x1, y1, depth + 1, branch_tag * 2.0 + 1.0)
-        right_angle = right_base + random_angle_jitter(x1, y1, depth + 1, branch_tag * 2.0 + 2.0)
-        grow(x1, y1, next_length, left_angle, depth + 1, branch_tag * 2.0 + 1.0)
-        grow(x1, y1, next_length, right_angle, depth + 1, branch_tag * 2.0 + 2.0)
+        left_angle = guidance_angle(x1, y1, angle + params["branch_angle_left"])
+        right_angle = guidance_angle(x1, y1, angle - params["branch_angle_right"])
+        grow(x1, y1, next_length, left_angle, depth + 1)
+        grow(x1, y1, next_length, right_angle, depth + 1)
 
     if params["seed_all_electrodes"] and electrode_points_all.size > 0:
         for ex, ey in electrode_points_all:
             center_angle = float(np.arctan2(params["meet_y"] - ey, params["meet_x"] - ex))
             root_angle = _blend_angles(params["angle"], center_angle, params["meet_blend"])
-            grow(float(ex), float(ey), params["root_length"], root_angle, 0, 1.0)
+            grow(float(ex), float(ey), params["root_length"], root_angle, 0)
     else:
         root_angle = params["angle"]
         if params["aim_electrodes"]:
@@ -668,7 +618,7 @@ def _evaluate_branching_fractal_field_from_normalized_coords(
             if root_target_angle is not None:
                 root_angle = _blend_angles(root_angle, root_target_angle, params["target_blend"])
 
-        grow(params["root_x"], params["root_y"], params["root_length"], root_angle, 0, 1.0)
+        grow(params["root_x"], params["root_y"], params["root_length"], root_angle, 0)
 
     if params["seed_all_electrodes"] and params["force_meet_center"] and electrode_points_all.size > 0:
         cx = float(params["meet_x"])
@@ -924,12 +874,6 @@ def build_field_geometry(mesh_obj, variable_mask, p1, p2, field_shape_cfg):
             p1=p1,
             p2=p2,
         )
-    if model == "element":
-        # Element model: one parameter per variable element
-        n_variable_elements = int(np.sum(variable_mask))
-        return {
-            "n_variable_elements": n_variable_elements,
-        }
     raise ValueError(f"Unsupported field-shape model: {model}")
 
 
@@ -937,7 +881,7 @@ def parameterized_state_from_theta(theta, field_geometry, field_shape_cfg):
     """Convert RBF parameters into a boolean high-conductivity state."""
     model = str(field_shape_cfg.get("model", "rbf")).strip().lower()
     theta = np.asarray(theta, dtype=float).ravel()
-    expected = parameter_vector_size_from_cfg(field_shape_cfg, field_geometry)
+    expected = parameter_vector_size_from_cfg(field_shape_cfg)
     if theta.size != expected:
         raise ValueError(f"Expected {expected} parameters, got {theta.size}")
 
@@ -959,12 +903,6 @@ def parameterized_state_from_theta(theta, field_geometry, field_shape_cfg):
         )
         state_high = field >= 0.0
         return np.asarray(state_high, dtype=bool), field
-
-    if model == "element":
-        # Element model: each parameter directly determines if element is high (param > 0) or low (param <= 0)
-        params_clipped = np.clip(theta, -1.0, 1.0)
-        state_high = params_clipped >= 0.0
-        return np.asarray(state_high, dtype=bool), params_clipped
 
     raise ValueError(f"Unsupported field-shape model: {model}")
 
@@ -1703,15 +1641,15 @@ def load_config(config_file="config.ini"):
     cfg.branching_length_decay = config.getfloat('field_shape', 'branching_length_decay', fallback=0.68)
     cfg.branching_width_frac = config.getfloat('field_shape', 'branching_width_frac', fallback=0.12)
     cfg.branching_width_decay = config.getfloat('field_shape', 'branching_width_decay', fallback=0.80)
-    cfg.branching_mirror_vertical = config.getboolean('field_shape', 'branching_mirror_vertical', fallback=False)
-    cfg.branching_aim_electrodes = config.getboolean('field_shape', 'branching_aim_electrodes', fallback=False)
-    cfg.branching_target_blend = config.getfloat('field_shape', 'branching_target_blend', fallback=0.0)
+    cfg.branching_mirror_vertical = config.getboolean('field_shape', 'branching_mirror_vertical', fallback=True)
+    cfg.branching_aim_electrodes = config.getboolean('field_shape', 'branching_aim_electrodes', fallback=True)
+    cfg.branching_target_blend = config.getfloat('field_shape', 'branching_target_blend', fallback=0.55)
     cfg.branching_root_x_frac = config.getfloat('field_shape', 'branching_root_x_frac', fallback=0.18)
     cfg.branching_root_y_frac = config.getfloat('field_shape', 'branching_root_y_frac', fallback=0.0)
     cfg.branching_seed_all_electrodes = config.getboolean(
         'field_shape',
         'branching_seed_all_electrodes',
-        fallback=True,
+        fallback=False,
     )
     cfg.branching_force_meet_center = config.getboolean(
         'field_shape',
@@ -1721,9 +1659,6 @@ def load_config(config_file="config.ini"):
     cfg.branching_meet_x_frac = config.getfloat('field_shape', 'branching_meet_x_frac', fallback=0.0)
     cfg.branching_meet_y_frac = config.getfloat('field_shape', 'branching_meet_y_frac', fallback=0.0)
     cfg.branching_meet_blend = config.getfloat('field_shape', 'branching_meet_blend', fallback=1.0)
-    cfg.branching_random_angle_frac = config.getfloat('field_shape', 'branching_random_angle_frac', fallback=0.00)
-    cfg.branching_random_center_boost = config.getfloat('field_shape', 'branching_random_center_boost', fallback=0.00)
-    cfg.branching_random_center_power = config.getfloat('field_shape', 'branching_random_center_power', fallback=2.0)
     cfg.branching_force_touch_all_electrodes = config.getboolean(
         'field_shape',
         'branching_force_touch_all_electrodes',
@@ -1814,19 +1749,16 @@ def create_default_config(config_file="config.ini"):
         'branching_length_decay': '0.68',
         'branching_width_frac': '0.12',
         'branching_width_decay': '0.80',
-        'branching_mirror_vertical': 'false',
-        'branching_aim_electrodes': 'false',
-        'branching_target_blend': '0.00',
+        'branching_mirror_vertical': 'true',
+        'branching_aim_electrodes': 'true',
+        'branching_target_blend': '0.55',
         'branching_root_x_frac': '0.18',
         'branching_root_y_frac': '0.0',
-        'branching_seed_all_electrodes': 'true',
+        'branching_seed_all_electrodes': 'false',
         'branching_force_meet_center': 'true',
         'branching_meet_x_frac': '0.0',
         'branching_meet_y_frac': '0.0',
         'branching_meet_blend': '1.0',
-        'branching_random_angle_frac': '0.35',
-        'branching_random_center_boost': '0.50',
-        'branching_random_center_power': '2.0',
         'branching_force_touch_all_electrodes': 'true',
         'electrode_support_k': '4',
     }
@@ -1889,9 +1821,6 @@ def run():
         "branching_meet_x_frac": float(args.branching_meet_x_frac),
         "branching_meet_y_frac": float(args.branching_meet_y_frac),
         "branching_meet_blend": float(args.branching_meet_blend),
-        "branching_random_angle_frac": float(args.branching_random_angle_frac),
-        "branching_random_center_boost": float(args.branching_random_center_boost),
-        "branching_random_center_power": float(args.branching_random_center_power),
         "branching_force_touch_all_electrodes": bool(args.branching_force_touch_all_electrodes),
     }
     field_geometry = build_field_geometry(
